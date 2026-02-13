@@ -50,10 +50,16 @@ type HomeState = {
   threadIds: number[];
 };
 
+type PollState = {
+  v: 1;
+  updatedAt: number;
+  home?: HomeState;
+  forums: Record<string, ForumState>;
+};
+
 const USERS_INDEX_KEY = "users";
 const FORUM_CACHE_KEY = "cache:forums";
-const HOME_STATE_KEY = "state:home";
-const FORUM_STATE_PREFIX = "state:forum:";
+const POLL_STATE_KEY = "state:poll";
 
 const DEFAULT_POLL_THREAD_LIMIT = 35;
 const DEFAULT_HOME_THREAD_LIMIT = 20;
@@ -93,6 +99,13 @@ export default {
   }
 };
 
+async function getPollState(env: Env): Promise<PollState | null> {
+  const s = (await env.KV.get(POLL_STATE_KEY, { type: "json" }).catch(() => null)) as PollState | null;
+  if (!s || s.v !== 1) return null;
+  if (!s.forums || typeof s.forums !== "object") return { ...s, forums: {} };
+  return s;
+}
+
 async function runScheduledPoll(env: Env, scheduledTimeMs: number): Promise<void> {
   const chatIds = await getUserChatIds(env);
   if (chatIds.length === 0) return;
@@ -119,26 +132,35 @@ async function runScheduledPoll(env: Env, scheduledTimeMs: number): Promise<void
     }
   }
 
+  const state = (await getPollState(env)) ?? { v: 1, updatedAt: 0, forums: {} };
+  let changed = false;
+
   for (const { forum, users: subs } of forumToUsers.values()) {
-    await pollForumAndNotify(env, forum, subs, scheduledTimeMs);
+    changed = (await pollForumAndNotify(env, state, forum, subs, scheduledTimeMs)) || changed;
   }
 
   if (globalUsers.length > 0) {
-    await pollHomeAndNotify(env, globalUsers, scheduledTimeMs);
+    changed = (await pollHomeAndNotify(env, state, globalUsers, scheduledTimeMs)) || changed;
+  }
+
+  if (changed) {
+    state.updatedAt = nowSec();
+    await env.KV.put(POLL_STATE_KEY, JSON.stringify(state));
   }
 }
 
 async function pollForumAndNotify(
   env: Env,
+  state: PollState,
   forum: ForumRef,
   subscribers: UserConfig[],
   nowMs: number
-): Promise<void> {
-  const stateKey = `${FORUM_STATE_PREFIX}${forum.id}`;
-  const existing = (await env.KV.get(stateKey, { type: "json" }).catch(() => null)) as ForumState | null;
+): Promise<boolean> {
+  const forumKey = String(forum.id);
+  const existing = state.forums[forumKey] ?? null;
 
   const html = await fetchText(forum.url);
-  if (!html) return;
+  if (!html) return false;
 
   const threads = parseThreadsFromHtml(html, env.SITE_BASE_URL, { source: "forum", forum }).slice(
     0,
@@ -155,8 +177,8 @@ async function pollForumAndNotify(
       updatedAt: nowSec,
       threads: buildThreadStateMap(threads)
     };
-    await env.KV.put(stateKey, JSON.stringify(primed));
-    return;
+    state.forums[forumKey] = primed;
+    return true;
   }
 
   const next: ForumState = {
@@ -195,9 +217,8 @@ async function pollForumAndNotify(
 
   next.threads = pruneThreadState(next.threads, threads, 120);
 
-  if (!shallowEqualRecords(existing.threads, next.threads)) {
-    await env.KV.put(stateKey, JSON.stringify(next));
-  }
+  const changed = !shallowEqualRecords(existing.threads, next.threads);
+  if (changed) state.forums[forumKey] = next;
 
   for (const t of newThreadEvents) {
     for (const u of subscribers) {
@@ -214,29 +235,30 @@ async function pollForumAndNotify(
       await tgSendMessage(env, u.chatId, formatThreadNotification("Nueva respuesta", t), true);
     }
   }
+
+  return changed;
 }
 
-async function pollHomeAndNotify(env: Env, subscribers: UserConfig[], nowMs: number): Promise<void> {
-  const existing = (await env.KV.get(HOME_STATE_KEY, { type: "json" }).catch(() => null)) as HomeState | null;
+async function pollHomeAndNotify(env: Env, state: PollState, subscribers: UserConfig[], nowMs: number): Promise<boolean> {
+  const existing = state.home ?? null;
   const html = await fetchText(env.SITE_BASE_URL);
-  if (!html) return;
+  if (!html) return false;
 
   const threads = parseThreadsFromHtml(html, env.SITE_BASE_URL, { source: "home" }).slice(0, DEFAULT_HOME_THREAD_LIMIT);
   const nowSec = Math.floor(nowMs / 1000);
 
   if (!existing) {
     const primed: HomeState = { v: 1, updatedAt: nowSec, threadIds: threads.map((t) => t.id) };
-    await env.KV.put(HOME_STATE_KEY, JSON.stringify(primed));
-    return;
+    state.home = primed;
+    return true;
   }
 
   const prevSet = new Set(existing.threadIds);
   const newOnHome = threads.filter((t) => !prevSet.has(t.id));
 
   const next: HomeState = { v: 1, updatedAt: nowSec, threadIds: threads.map((t) => t.id) };
-  if (!arrayEqual(existing.threadIds, next.threadIds)) {
-    await env.KV.put(HOME_STATE_KEY, JSON.stringify(next));
-  }
+  const changed = !arrayEqual(existing.threadIds, next.threadIds);
+  if (changed) state.home = next;
 
   for (const t of newOnHome) {
     for (const u of subscribers) {
@@ -245,6 +267,8 @@ async function pollHomeAndNotify(env: Env, subscribers: UserConfig[], nowMs: num
       await tgSendMessage(env, u.chatId, formatThreadNotification("Nuevo tema", t), true);
     }
   }
+
+  return changed;
 }
 
 function matchesUserFilters(u: UserConfig, t: ThreadItem): boolean {
@@ -856,6 +880,8 @@ function parseThreadsFromHtml(
   baseUrl: string,
   opts: { source: "home" | "forum"; forum?: ForumRef }
 ): ThreadItem[] {
+  const searchHtml = opts.source === "home" ? sliceHomeLatestBlock(html) : html;
+
   const threadHrefRe = new RegExp(
     `<a\\b[^>]*href="([^"]*(?:${THREAD_PATHS.map(escapeRe).join("|")})[^"]+)"[^>]*>([\\s\\S]*?)<\\/a>`,
     "gi"
@@ -865,7 +891,7 @@ function parseThreadsFromHtml(
   const seen = new Set<number>();
 
   let m: RegExpExecArray | null;
-  while ((m = threadHrefRe.exec(html)) !== null) {
+  while ((m = threadHrefRe.exec(searchHtml)) !== null) {
     const hrefRaw = m[1] ?? "";
     const title = htmlToText(m[2] ?? "");
     const threadId = threadIdFromHref(hrefRaw);
@@ -877,8 +903,8 @@ function parseThreadsFromHtml(
 
     const matchIndex = m.index ?? 0;
     const chunkStart = Math.max(0, matchIndex - 900);
-    const chunkEnd = Math.min(html.length, matchIndex + m[0].length + 3000);
-    const chunk = html.slice(chunkStart, chunkEnd);
+    const chunkEnd = Math.min(searchHtml.length, matchIndex + m[0].length + 3000);
+    const chunk = searchHtml.slice(chunkStart, chunkEnd);
     const anchorPos = matchIndex - chunkStart;
 
     const updatedAt = extractLatestTimestamp(chunk);
@@ -902,6 +928,25 @@ function parseThreadsFromHtml(
   }
 
   return out;
+}
+
+function sliceHomeLatestBlock(html: string): string {
+  const lower = html.toLowerCase();
+  const markers = [
+    "nuevos temas publicados",
+    "nuevas publicaciones",
+    "latest threads",
+    "new threads"
+  ];
+
+  for (const marker of markers) {
+    const idx = lower.indexOf(marker);
+    if (idx === -1) continue;
+    return html.slice(idx, idx + 160_000);
+  }
+
+  // Fallback: whole document.
+  return html;
 }
 
 function extractForumFromChunk(chunk: string, baseUrl: string): ForumRef | null {
