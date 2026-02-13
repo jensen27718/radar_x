@@ -13,12 +13,13 @@ Si el token ya fue compartido en publico, revocalo y genera uno nuevo con BotFat
 - Filtros por usuario:
   - Suscripcion a foros (por URL o desde `/foros`)
   - Palabras clave (incluir / excluir)
-  - Prefijos/labels (ej: "Reseña", "Pregunta", etc, si el sitio los expone en HTML)
+  - Prefijos/labels (ej: "Resena", "Pregunta", etc, si el sitio los expone en HTML)
 - Notificaciones automaticas:
   - Nuevo tema (thread)
   - Nueva respuesta (reply) en foros suscritos (best-effort, basado en timestamps del HTML)
 - Comandos para navegar:
   - `/latest` muestra los ultimos resultados con tus filtros
+  - `/leer <url>` devuelve titulo + extracto del contenido (tambien funciona si pegas un link directo)
 
 ## Comandos del bot
 
@@ -34,6 +35,7 @@ Si el token ya fue compartido en publico, revocalo y genera uno nuevo con BotFat
 - `/notify replies on|off`
 - `/list` (o `/filtros`)
 - `/latest` (o `/ultimos`)
+- `/leer <url>` (o `/read <url>`)
 
 ## Despliegue (Cloudflare Workers + KV + Cron)
 
@@ -47,33 +49,33 @@ Pasos:
 1. Instalar dependencias:
 
 ```powershell
-npm install
+npm.cmd install
 ```
 
 2. Login en Cloudflare:
 
 ```powershell
-npx wrangler login
+npx.cmd wrangler login
 ```
 
 3. Crear un KV namespace y pegar los IDs en `wrangler.toml`:
 
 ```powershell
-npx wrangler kv namespace create "radar_x_kv"
-npx wrangler kv namespace create "radar_x_kv_preview" --preview
+npx.cmd wrangler kv namespace create "radar_x_kv"
+npx.cmd wrangler kv namespace create "radar_x_kv_preview" --preview
 ```
 
 4. Cargar secretos:
 
 ```powershell
-npx wrangler secret put TELEGRAM_BOT_TOKEN
-npx wrangler secret put TELEGRAM_WEBHOOK_SECRET_TOKEN
+npx.cmd wrangler secret put TELEGRAM_BOT_TOKEN
+npx.cmd wrangler secret put TELEGRAM_WEBHOOK_SECRET_TOKEN
 ```
 
 5. Deploy:
 
 ```powershell
-npm run deploy
+npm.cmd run deploy
 ```
 
 6. Configurar el webhook de Telegram:
@@ -91,6 +93,6 @@ Invoke-RestMethod -Method Post `
 
 ## Notas
 
+- Si es la primera vez que usas Workers en esa cuenta, registra tu subdominio `workers.dev` en el dashboard de Cloudflare (Workers & Pages) antes del primer deploy.
 - El cron esta configurado en `wrangler.toml` cada 5 minutos (`*/5 * * * *`).
 - La primera ejecucion "primea" estado y no manda spam historico. Para ver contenido inmediato usa `/latest`.
-

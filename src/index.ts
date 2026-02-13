@@ -330,6 +330,25 @@ async function handleTelegramMessage(message: any, env: Env): Promise<void> {
   const cmd = parseCommand(text);
 
   if (!cmd) {
+    // If the user pastes a forum/thread URL, handle it as a shortcut.
+    const pastedUrl = extractFirstUrl(text);
+    if (pastedUrl) {
+      const user = await ensureUser(env, chatId);
+      const forum = await resolveForumFromArg(env, pastedUrl);
+      if (forum) {
+        const next = addForum(user, forum);
+        await putUser(env, next);
+        await tgSendMessage(env, chatId, `Suscrito a: ${forum.name} (${forum.id})`, true);
+        return;
+      }
+
+      const threadId = threadIdFromHref(pastedUrl);
+      if (threadId) {
+        await handleReadCommand(env, chatId, pastedUrl);
+        return;
+      }
+    }
+
     await tgSendMessage(env, chatId, helpText(), true);
     return;
   }
@@ -486,6 +505,16 @@ async function handleTelegramMessage(message: any, env: Env): Promise<void> {
     return;
   }
 
+  if (name === "read" || name === "leer") {
+    const url = extractFirstUrl(args) ?? args.trim();
+    if (!url) {
+      await tgSendMessage(env, chatId, "Uso: /leer <url>  (ej: /leer https://doncolombia.com/temas/... )", true);
+      return;
+    }
+    await handleReadCommand(env, chatId, url);
+    return;
+  }
+
   if (name === "latest" || name === "ultimos") {
     const items = await getLatestForUser(env, user);
     if (items.length === 0) {
@@ -585,6 +614,81 @@ function uniqueThreads(items: ThreadItem[]): ThreadItem[] {
   return out;
 }
 
+async function handleReadCommand(env: Env, chatId: number, urlRaw: string): Promise<void> {
+  let url: URL;
+  try {
+    url = new URL(urlRaw, env.SITE_BASE_URL);
+  } catch {
+    await tgSendMessage(env, chatId, "URL invalida. Uso: /leer <url>", true);
+    return;
+  }
+
+  // SSRF/abuse guard: only fetch the configured site.
+  const base = new URL(env.SITE_BASE_URL);
+  if (url.hostname !== base.hostname) {
+    await tgSendMessage(env, chatId, `Solo puedo leer enlaces de: ${base.hostname}`, true);
+    return;
+  }
+
+  const html = await fetchText(url.toString());
+  if (!html) {
+    await tgSendMessage(env, chatId, "No pude leer esa pagina (fetch fallo).", true);
+    return;
+  }
+
+  const title =
+    extractMetaProperty(html, "og:title") ??
+    extractTitleTag(html) ??
+    url.toString();
+
+  const ogDesc = extractMetaProperty(html, "og:description");
+  const body = extractFirstPostText(html);
+  const content = preferLonger(ogDesc, body);
+
+  const text = content
+    ? `${title}\n\n${content}\n\n${url.toString()}`
+    : `${title}\n\n${url.toString()}`;
+
+  await tgSendLongMessage(env, chatId, text, true);
+}
+
+function extractMetaProperty(html: string, property: string): string | null {
+  const p = escapeRe(property);
+  const re1 = new RegExp(`<meta\\b[^>]*property=["']${p}["'][^>]*content=["']([^"']+)["'][^>]*>`, "i");
+  const m1 = re1.exec(html);
+  if (m1?.[1]) return decodeHtmlEntities(m1[1]).trim();
+
+  const re2 = new RegExp(`<meta\\b[^>]*content=["']([^"']+)["'][^>]*property=["']${p}["'][^>]*>`, "i");
+  const m2 = re2.exec(html);
+  if (m2?.[1]) return decodeHtmlEntities(m2[1]).trim();
+
+  return null;
+}
+
+function extractTitleTag(html: string): string | null {
+  const m = /<title[^>]*>([\s\S]*?)<\/title>/i.exec(html);
+  if (!m?.[1]) return null;
+  const t = htmlToText(m[1]);
+  return t || null;
+}
+
+function extractFirstPostText(html: string): string | null {
+  // XenForo commonly wraps message content in a "bbWrapper" div.
+  const m = /class="bbWrapper"[^>]*>([\s\S]*?)<\/div>/i.exec(html);
+  if (!m?.[1]) return null;
+  const t = htmlToText(m[1]);
+  return t || null;
+}
+
+function preferLonger(a: string | null, b: string | null): string | null {
+  const aa = (a ?? "").trim();
+  const bb = (b ?? "").trim();
+  if (!aa && !bb) return null;
+  if (!aa) return bb;
+  if (!bb) return aa;
+  return aa.length >= bb.length ? aa : bb;
+}
+
 async function sendForumsPage(
   env: Env,
   user: UserConfig,
@@ -647,6 +751,11 @@ function parseCommand(text: string): { name: string; args: string } | null {
   return { name: normalize(m[1] ?? ""), args: String(m[2] ?? "").trim() };
 }
 
+function extractFirstUrl(text: string): string | null {
+  const m = String(text ?? "").match(/https?:\/\/[^\s<>"']+/i);
+  return m ? m[0] : null;
+}
+
 function startText(): string {
   return [
     "Bot listo.",
@@ -658,7 +767,8 @@ function startText(): string {
     "/addforum <url>  (suscribirte por URL)",
     "/addkw <palabra>  (filtrar por keyword)",
     "/list  (ver filtros)",
-    "/latest  (ver ultimos resultados)"
+    "/latest  (ver ultimos resultados)",
+    "/leer <url>  (leer un tema dentro de Telegram)"
   ].join("\n");
 }
 
@@ -673,7 +783,8 @@ function helpText(): string {
     "/notify threads on|off",
     "/notify replies on|off",
     "/list",
-    "/latest"
+    "/latest",
+    "/leer <url>"
   ].join("\n");
 }
 
@@ -1132,8 +1243,8 @@ async function telegramApi(env: Env, method: string, payload: any): Promise<any>
       headers: { "content-type": "application/json" },
       body: JSON.stringify(payload)
     });
-    const data = await res.json().catch(() => null);
-    if (!res.ok || !data?.ok) return null;
+    const data = (await res.json().catch(() => null)) as any;
+    if (!res.ok || !data || data.ok !== true) return null;
     return data.result;
   } catch {
     return null;
@@ -1153,6 +1264,32 @@ async function tgSendMessage(
     disable_web_page_preview: disablePreview,
     reply_markup: replyMarkup
   });
+}
+
+async function tgSendLongMessage(env: Env, chatId: number, text: string, disablePreview: boolean): Promise<void> {
+  // Telegram message limit is 4096 chars; keep a safe margin.
+  const max = 3500;
+  const maxParts = 3;
+
+  let remaining = String(text ?? "").trim();
+  let part = 0;
+  while (remaining.length > 0 && part < maxParts) {
+    let chunk = remaining;
+    if (chunk.length > max) {
+      chunk = remaining.slice(0, max);
+      const cut = chunk.lastIndexOf("\n");
+      if (cut > 0.6 * max) chunk = chunk.slice(0, cut);
+    }
+    chunk = chunk.trim();
+    if (!chunk) break;
+    await tgSendMessage(env, chatId, chunk, disablePreview);
+    remaining = remaining.slice(chunk.length).trimStart();
+    part++;
+  }
+
+  if (remaining.length > 0) {
+    await tgSendMessage(env, chatId, "(Truncado. Abre el enlace para ver todo el contenido.)", true);
+  }
 }
 
 async function tgEditMessage(env: Env, chatId: number, messageId: number, text: string, replyMarkup: any): Promise<void> {
