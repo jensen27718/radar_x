@@ -1125,15 +1125,19 @@ async function fetchText(url: string): Promise<string | null> {
 }
 
 async function telegramApi(env: Env, method: string, payload: any): Promise<any> {
-  const url = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/${method}`;
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(payload)
-  });
-  const data = await res.json().catch(() => null);
-  if (!res.ok || !data?.ok) return null;
-  return data.result;
+  try {
+    const url = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/${method}`;
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+    const data = await res.json().catch(() => null);
+    if (!res.ok || !data?.ok) return null;
+    return data.result;
+  } catch {
+    return null;
+  }
 }
 
 async function tgSendMessage(
