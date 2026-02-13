@@ -23,6 +23,7 @@ Si el token ya fue compartido en publico, revocalo y genera uno nuevo con BotFat
 
 ## Comandos del bot
 
+- Recomendado: usa `/start` y sigue el wizard por botones (ciudades, foros, ultimas 5).
 - `/start`
 - `/help`
 - `/foros` (lista con botones para suscribirte / quitar)

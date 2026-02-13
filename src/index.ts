@@ -48,6 +48,8 @@ type HomeState = {
   updatedAt: number;
   // recent thread ids in display order, used for "new thread" detection
   threadIds: number[];
+  // threadId -> lastSeenUpdatedAt (epoch seconds) ; 0 when unknown
+  threads: Record<string, number>;
 };
 
 type PollState = {
@@ -67,6 +69,36 @@ const DEFAULT_LATEST_RESULT_LIMIT = 10;
 
 const FORUM_PATHS = ["/foros/", "/forums/"];
 const THREAD_PATHS = ["/temas/", "/threads/"];
+
+const CITY_PRESETS: { id: string; name: string }[] = [
+  { id: "bogota", name: "Bogota" },
+  { id: "medellin", name: "Medellin" },
+  { id: "cali", name: "Cali" },
+  { id: "barranquilla", name: "Barranquilla" },
+  { id: "cartagena", name: "Cartagena" },
+  { id: "bucaramanga", name: "Bucaramanga" },
+  { id: "pereira", name: "Pereira" },
+  { id: "manizales", name: "Manizales" },
+  { id: "cucuta", name: "Cucuta" },
+  { id: "santa_marta", name: "Santa Marta" },
+  { id: "ibague", name: "Ibague" },
+  { id: "villavicencio", name: "Villavicencio" },
+  { id: "pasto", name: "Pasto" },
+  { id: "armenia", name: "Armenia" },
+  { id: "neiva", name: "Neiva" },
+  { id: "monteria", name: "Monteria" },
+  { id: "sincelejo", name: "Sincelejo" },
+  { id: "valledupar", name: "Valledupar" },
+  { id: "tunja", name: "Tunja" },
+  { id: "popayan", name: "Popayan" },
+  { id: "riohacha", name: "Riohacha" },
+  { id: "quibdo", name: "Quibdo" },
+  { id: "leticia", name: "Leticia" },
+  { id: "san_andres", name: "San Andres" }
+];
+
+const CITY_PAGE_SIZE = 8;
+const PICKS_TTL_SEC = 60 * 60;
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -102,8 +134,30 @@ export default {
 async function getPollState(env: Env): Promise<PollState | null> {
   const s = (await env.KV.get(POLL_STATE_KEY, { type: "json" }).catch(() => null)) as PollState | null;
   if (!s || s.v !== 1) return null;
-  if (!s.forums || typeof s.forums !== "object") return { ...s, forums: {} };
-  return s;
+  const next: PollState = {
+    v: 1,
+    updatedAt: typeof s.updatedAt === "number" ? s.updatedAt : 0,
+    forums: s.forums && typeof s.forums === "object" ? s.forums : {}
+  };
+
+  if (s.home && typeof s.home === "object") {
+    const threadIds = Array.isArray((s.home as any).threadIds) ? ((s.home as any).threadIds as any[]) : [];
+    const ids = threadIds.map((x) => Number(x)).filter((n) => Number.isFinite(n));
+    const threads =
+      (s.home as any).threads && typeof (s.home as any).threads === "object"
+        ? ((s.home as any).threads as Record<string, number>)
+        : {};
+
+    // Backward compat: older state had only threadIds.
+    for (const id of ids) {
+      const k = String(id);
+      if (threads[k] === undefined) threads[k] = 0;
+    }
+
+    next.home = { v: 1, updatedAt: typeof (s.home as any).updatedAt === "number" ? (s.home as any).updatedAt : 0, threadIds: ids, threads };
+  }
+
+  return next;
 }
 
 async function runScheduledPoll(env: Env, scheduledTimeMs: number): Promise<void> {
@@ -248,23 +302,67 @@ async function pollHomeAndNotify(env: Env, state: PollState, subscribers: UserCo
   const nowSec = Math.floor(nowMs / 1000);
 
   if (!existing) {
-    const primed: HomeState = { v: 1, updatedAt: nowSec, threadIds: threads.map((t) => t.id) };
+    const primed: HomeState = {
+      v: 1,
+      updatedAt: nowSec,
+      threadIds: threads.map((t) => t.id),
+      threads: buildThreadStateMap(threads)
+    };
     state.home = primed;
     return true;
   }
 
-  const prevSet = new Set(existing.threadIds);
-  const newOnHome = threads.filter((t) => !prevSet.has(t.id));
+  const next: HomeState = {
+    v: 1,
+    updatedAt: nowSec,
+    threadIds: threads.map((t) => t.id),
+    threads: { ...(existing.threads ?? {}) }
+  };
 
-  const next: HomeState = { v: 1, updatedAt: nowSec, threadIds: threads.map((t) => t.id) };
-  const changed = !arrayEqual(existing.threadIds, next.threadIds);
+  const newThreadEvents: ThreadItem[] = [];
+  const updatedThreadEvents: ThreadItem[] = [];
+
+  for (const t of threads) {
+    const tid = String(t.id);
+    const current = t.updatedAt ?? 0;
+    const prev = (existing.threads ?? {})[tid];
+
+    if (prev === undefined) {
+      newThreadEvents.push(t);
+      next.threads[tid] = current;
+      continue;
+    }
+
+    if ((prev ?? 0) === 0 && current > 0) {
+      next.threads[tid] = current;
+      continue;
+    }
+
+    if (current > 0 && prev > 0 && current > prev) {
+      updatedThreadEvents.push(t);
+      next.threads[tid] = current;
+      continue;
+    }
+  }
+
+  next.threads = pruneThreadState(next.threads, threads, 120);
+
+  const changed = !arrayEqual(existing.threadIds, next.threadIds) || !shallowEqualRecords(existing.threads ?? {}, next.threads);
   if (changed) state.home = next;
 
-  for (const t of newOnHome) {
+  for (const t of newThreadEvents) {
     for (const u of subscribers) {
       if (!u.notifyThreads) continue;
       if (!matchesUserFilters(u, t)) continue;
       await tgSendMessage(env, u.chatId, formatThreadNotification("Nuevo tema", t), true);
+    }
+  }
+
+  for (const t of updatedThreadEvents) {
+    for (const u of subscribers) {
+      if (!u.notifyReplies) continue;
+      if (!matchesUserFilters(u, t)) continue;
+      await tgSendMessage(env, u.chatId, formatThreadNotification("Nueva respuesta", t), true);
     }
   }
 
@@ -339,6 +437,7 @@ async function handleTelegramMessage(message: any, env: Env): Promise<void> {
         const next = addForum(user, forum);
         await putUser(env, next);
         await tgSendMessage(env, chatId, `Suscrito a: ${forum.name} (${forum.id})`, true);
+        await sendLatestWithButtons(env, next, chatId, 5);
         return;
       }
 
@@ -349,7 +448,8 @@ async function handleTelegramMessage(message: any, env: Env): Promise<void> {
       }
     }
 
-    await tgSendMessage(env, chatId, helpText(), true);
+    const user = await ensureUser(env, chatId);
+    await sendMainMenu(env, user, chatId, false);
     return;
   }
 
@@ -357,13 +457,14 @@ async function handleTelegramMessage(message: any, env: Env): Promise<void> {
   const args = cmd.args;
 
   if (name === "start") {
-    await ensureUser(env, chatId);
-    await tgSendMessage(env, chatId, startText(), true);
+    const user = await ensureUser(env, chatId);
+    await sendMainMenu(env, user, chatId, false);
     return;
   }
 
   if (name === "help") {
-    await tgSendMessage(env, chatId, helpText(), true);
+    const user = await ensureUser(env, chatId);
+    await sendHelpPage(env, user, chatId, false);
     return;
   }
 
@@ -393,6 +494,7 @@ async function handleTelegramMessage(message: any, env: Env): Promise<void> {
     const next = addForum(user, forum);
     await putUser(env, next);
     await tgSendMessage(env, chatId, `Suscrito a: ${forum.name} (${forum.id})`, true);
+    await sendLatestWithButtons(env, next, chatId, 5);
     return;
   }
 
@@ -405,6 +507,7 @@ async function handleTelegramMessage(message: any, env: Env): Promise<void> {
     const next = { ...user, forums: user.forums.filter((f) => f.id !== forumId), updatedAt: nowSec() };
     await putUser(env, next);
     await tgSendMessage(env, chatId, `Foro eliminado: ${forumId}`, true);
+    await sendLatestWithButtons(env, next, chatId, 5);
     return;
   }
 
@@ -417,6 +520,7 @@ async function handleTelegramMessage(message: any, env: Env): Promise<void> {
     const next = addUnique(user, "includeKeywords", kw);
     await putUser(env, next);
     await tgSendMessage(env, chatId, `Keyword agregado: ${kw}`, true);
+    await sendLatestWithButtons(env, next, chatId, 5);
     return;
   }
 
@@ -429,6 +533,7 @@ async function handleTelegramMessage(message: any, env: Env): Promise<void> {
     const next = removeValue(user, "includeKeywords", kw);
     await putUser(env, next);
     await tgSendMessage(env, chatId, `Keyword eliminado: ${kw}`, true);
+    await sendLatestWithButtons(env, next, chatId, 5);
     return;
   }
 
@@ -441,6 +546,7 @@ async function handleTelegramMessage(message: any, env: Env): Promise<void> {
     const next = addUnique(user, "excludeKeywords", kw);
     await putUser(env, next);
     await tgSendMessage(env, chatId, `Exclusion agregada: ${kw}`, true);
+    await sendLatestWithButtons(env, next, chatId, 5);
     return;
   }
 
@@ -453,6 +559,7 @@ async function handleTelegramMessage(message: any, env: Env): Promise<void> {
     const next = removeValue(user, "excludeKeywords", kw);
     await putUser(env, next);
     await tgSendMessage(env, chatId, `Exclusion eliminada: ${kw}`, true);
+    await sendLatestWithButtons(env, next, chatId, 5);
     return;
   }
 
@@ -465,6 +572,7 @@ async function handleTelegramMessage(message: any, env: Env): Promise<void> {
     const next = addUnique(user, "prefixes", p);
     await putUser(env, next);
     await tgSendMessage(env, chatId, `Prefijo agregado: ${p}`, true);
+    await sendLatestWithButtons(env, next, chatId, 5);
     return;
   }
 
@@ -477,6 +585,7 @@ async function handleTelegramMessage(message: any, env: Env): Promise<void> {
     const next = removeValue(user, "prefixes", p);
     await putUser(env, next);
     await tgSendMessage(env, chatId, `Prefijo eliminado: ${p}`, true);
+    await sendLatestWithButtons(env, next, chatId, 5);
     return;
   }
 
@@ -516,20 +625,11 @@ async function handleTelegramMessage(message: any, env: Env): Promise<void> {
   }
 
   if (name === "latest" || name === "ultimos") {
-    const items = await getLatestForUser(env, user);
-    if (items.length === 0) {
-      await tgSendMessage(env, chatId, "No encontre resultados con tus filtros.", true);
-      return;
-    }
-    const lines = items.slice(0, DEFAULT_LATEST_RESULT_LIMIT).map((t) => {
-      const head = `${t.forum?.name ? `[${t.forum.name}] ` : ""}${t.prefix ? `[${t.prefix}] ` : ""}${t.title}`;
-      return `${head}\n${t.url}`;
-    });
-    await tgSendMessage(env, chatId, lines.join("\n\n"), true);
+    await sendLatestWithButtons(env, user, chatId, 5);
     return;
   }
 
-  await tgSendMessage(env, chatId, helpText(), true);
+  await sendMainMenu(env, user, chatId, false);
 }
 
 async function handleTelegramCallback(cb: any, env: Env): Promise<void> {
@@ -538,6 +638,140 @@ async function handleTelegramCallback(cb: any, env: Env): Promise<void> {
 
   const data = String(cb.data ?? "");
   const user = await ensureUser(env, chatId);
+  const messageId = cb.message?.message_id;
+
+  if (data.startsWith("readpick:")) {
+    const parts = data.split(":");
+    const token = parts[1] ?? "";
+    const idx = parseInt(parts[2] ?? "", 10);
+    if (!token || !Number.isFinite(idx)) {
+      await tgAnswerCallback(env, cb.id, "");
+      return;
+    }
+    const pickKey = `pick:${chatId}:${token}`;
+    const pick = (await env.KV.get(pickKey, { type: "json" }).catch(() => null)) as any;
+    const urls: unknown = pick?.urls;
+    if (!pick || pick.chatId !== chatId || !Array.isArray(urls) || idx < 0 || idx >= urls.length) {
+      await tgAnswerCallback(env, cb.id, "Expirado");
+      return;
+    }
+    const url = String(urls[idx] ?? "");
+    if (!url) {
+      await tgAnswerCallback(env, cb.id, "");
+      return;
+    }
+    await tgAnswerCallback(env, cb.id, "Leyendo...");
+    await handleReadCommand(env, chatId, url);
+    return;
+  }
+
+  if (data.startsWith("notify_set:")) {
+    const parts = data.split(":");
+    const target = parts[1] ?? "";
+    const mode = parts[2] ?? "";
+    const next = { ...user, updatedAt: nowSec() };
+    if (target === "threads") next.notifyThreads = mode === "on";
+    else if (target === "replies") next.notifyReplies = mode === "on";
+    await putUser(env, next);
+    if (messageId) await sendNotifyPage(env, next, chatId, true, messageId);
+    await tgAnswerCallback(env, cb.id, "Guardado");
+    return;
+  }
+
+  if (data.startsWith("city_toggle:")) {
+    const parts = data.split(":");
+    const cityId = parts[1] ?? "";
+    const page = parseInt(parts[2] ?? "0", 10);
+    const city = CITY_PRESETS.find((c) => c.id === cityId);
+    if (!city) {
+      await tgAnswerCallback(env, cb.id, "");
+      return;
+    }
+
+    const isOn = user.includeKeywords.some((k) => normalize(k) === normalize(city.name));
+    let next = isOn ? removeValue(user, "includeKeywords", city.name) : addUnique(user, "includeKeywords", city.name);
+
+    // Best-effort: if there is exactly one forum whose name contains the city, auto-subscribe.
+    if (!isOn) {
+      const cache = await getForumCache(env);
+      const hits = cache.forums.filter((f) => normalize(f.name).includes(normalize(city.name)));
+      if (hits.length === 1) next = addForum(next, hits[0]);
+    }
+
+    await putUser(env, next);
+    if (messageId) await sendCitiesPage(env, next, chatId, Number.isFinite(page) ? page : 0, true, messageId);
+    await tgAnswerCallback(env, cb.id, "Aplicado");
+    await sendLatestWithButtons(env, next, chatId, 5);
+    return;
+  }
+
+  if (data.startsWith("wiz:")) {
+    const parts = data.split(":");
+    const action = parts[1] ?? "";
+    const arg = parts[2] ?? "";
+
+    if (action === "main") {
+      if (messageId) await sendMainMenu(env, user, chatId, true, messageId);
+      await tgAnswerCallback(env, cb.id, "");
+      return;
+    }
+
+    if (action === "help") {
+      if (messageId) await sendHelpPage(env, user, chatId, true, messageId);
+      await tgAnswerCallback(env, cb.id, "");
+      return;
+    }
+
+    if (action === "me") {
+      if (messageId) await sendMePage(env, user, chatId, true, messageId);
+      await tgAnswerCallback(env, cb.id, "");
+      return;
+    }
+
+    if (action === "notify") {
+      if (messageId) await sendNotifyPage(env, user, chatId, true, messageId);
+      await tgAnswerCallback(env, cb.id, "");
+      return;
+    }
+
+    if (action === "cities") {
+      const page = parseInt(arg ?? "0", 10);
+      if (messageId) await sendCitiesPage(env, user, chatId, Number.isFinite(page) ? page : 0, true, messageId);
+      await tgAnswerCallback(env, cb.id, "");
+      return;
+    }
+
+    if (action === "forums") {
+      const page = parseInt(arg ?? "0", 10);
+      if (messageId) await sendForumsPage(env, user, chatId, Number.isFinite(page) ? page : 0, true, messageId);
+      await tgAnswerCallback(env, cb.id, "");
+      return;
+    }
+
+    if (action === "latest") {
+      await tgAnswerCallback(env, cb.id, "Buscando...");
+      await sendLatestWithButtons(env, user, chatId, 5);
+      return;
+    }
+
+    if (action === "reset") {
+      const next: UserConfig = {
+        ...user,
+        forums: [],
+        includeKeywords: [],
+        excludeKeywords: [],
+        prefixes: [],
+        notifyThreads: true,
+        notifyReplies: true,
+        updatedAt: nowSec()
+      };
+      await putUser(env, next);
+      if (messageId) await sendMainMenu(env, next, chatId, true, messageId);
+      await tgAnswerCallback(env, cb.id, "Listo");
+      await sendLatestWithButtons(env, next, chatId, 5);
+      return;
+    }
+  }
 
   if (data.startsWith("forums_page:")) {
     const page = parseInt(data.split(":")[1] ?? "0", 10);
@@ -564,6 +798,7 @@ async function handleTelegramCallback(cb: any, env: Env): Promise<void> {
     await putUser(env, next);
     await sendForumsPage(env, next, chatId, 0, true, cb.message?.message_id);
     await tgAnswerCallback(env, cb.id, `Suscrito: ${forum.name}`);
+    await sendLatestWithButtons(env, next, chatId, 5);
     return;
   }
 
@@ -573,6 +808,7 @@ async function handleTelegramCallback(cb: any, env: Env): Promise<void> {
     await putUser(env, next);
     await sendForumsPage(env, next, chatId, 0, true, cb.message?.message_id);
     await tgAnswerCallback(env, cb.id, `Eliminado: ${forumId}`);
+    await sendLatestWithButtons(env, next, chatId, 5);
     return;
   }
 
@@ -689,6 +925,190 @@ function preferLonger(a: string | null, b: string | null): string | null {
   return aa.length >= bb.length ? aa : bb;
 }
 
+async function sendMainMenu(
+  env: Env,
+  user: UserConfig,
+  chatId: number,
+  edit: boolean,
+  messageId?: number
+): Promise<void> {
+  const selectedTopics = user.includeKeywords.length ? user.includeKeywords.slice(0, 3).join(", ") : "(ninguno)";
+  const text = ["Menu", "", `Temas/Ciudades: ${selectedTopics}`, `Foros: ${user.forums.length}`, "", "Usa los botones:"].join("\n");
+
+  const replyMarkup = {
+    inline_keyboard: [
+      [{ text: "Elegir ciudad", callback_data: "wiz:cities:0" }],
+      [{ text: "Elegir foros", callback_data: "wiz:forums:0" }],
+      [{ text: "Ultimas 5", callback_data: "wiz:latest" }],
+      [{ text: "Mis filtros", callback_data: "wiz:me" }],
+      [{ text: "Notificaciones", callback_data: "wiz:notify" }],
+      [{ text: "Ayuda", callback_data: "wiz:help" }],
+      [{ text: "Limpiar todo", callback_data: "wiz:reset" }]
+    ]
+  };
+
+  if (edit && messageId) await tgEditMessage(env, chatId, messageId, text, replyMarkup);
+  else await tgSendMessage(env, chatId, text, true, replyMarkup);
+}
+
+async function sendHelpPage(env: Env, user: UserConfig, chatId: number, edit: boolean, messageId?: number): Promise<void> {
+  const text = [
+    "Ayuda",
+    "",
+    "1) Toca 'Elegir ciudad' o 'Elegir foros' para filtrar.",
+    "2) Cada cambio te envia las ultimas 5 publicaciones con botones Abrir/Leer.",
+    "3) En el cron te llegaran alertas cuando haya nuevos temas o actualizaciones.",
+    "",
+    "Tip: si pegas un link de un tema, el bot intenta leerte un extracto."
+  ].join("\n");
+
+  const replyMarkup = { inline_keyboard: [[{ text: "Menu", callback_data: "wiz:main" }]] };
+  if (edit && messageId) await tgEditMessage(env, chatId, messageId, text, replyMarkup);
+  else await tgSendMessage(env, chatId, text, true, replyMarkup);
+}
+
+async function sendMePage(env: Env, user: UserConfig, chatId: number, edit: boolean, messageId?: number): Promise<void> {
+  const cities = user.includeKeywords.length ? user.includeKeywords.join(", ") : "(ninguno)";
+  const forums = user.forums.length ? user.forums.map((f) => f.name).slice(0, 6).join(", ") : "(ninguno)";
+  const text = [
+    "Mis filtros",
+    "",
+    `Temas/Ciudades: ${cities}`,
+    `Foros: ${forums}`,
+    "",
+    `Notificaciones: temas=${user.notifyThreads ? "on" : "off"}, respuestas=${user.notifyReplies ? "on" : "off"}`
+  ].join("\n");
+
+  const replyMarkup = {
+    inline_keyboard: [
+      [{ text: "Ultimas 5", callback_data: "wiz:latest" }],
+      [{ text: "Editar ciudades", callback_data: "wiz:cities:0" }],
+      [{ text: "Editar foros", callback_data: "wiz:forums:0" }],
+      [{ text: "Menu", callback_data: "wiz:main" }]
+    ]
+  };
+
+  if (edit && messageId) await tgEditMessage(env, chatId, messageId, text, replyMarkup);
+  else await tgSendMessage(env, chatId, text, true, replyMarkup);
+}
+
+async function sendNotifyPage(env: Env, user: UserConfig, chatId: number, edit: boolean, messageId?: number): Promise<void> {
+  const text = [
+    "Notificaciones",
+    "",
+    `Temas nuevos: ${user.notifyThreads ? "ON" : "OFF"}`,
+    `Respuestas/actualizaciones: ${user.notifyReplies ? "ON" : "OFF"}`,
+    "",
+    "Cambia con los botones:"
+  ].join("\n");
+
+  const replyMarkup = {
+    inline_keyboard: [
+      [
+        { text: `Temas: ${user.notifyThreads ? "ON" : "OFF"}`, callback_data: `notify_set:threads:${user.notifyThreads ? "off" : "on"}` },
+        { text: `Respuestas: ${user.notifyReplies ? "ON" : "OFF"}`, callback_data: `notify_set:replies:${user.notifyReplies ? "off" : "on"}` }
+      ],
+      [{ text: "Menu", callback_data: "wiz:main" }]
+    ]
+  };
+
+  if (edit && messageId) await tgEditMessage(env, chatId, messageId, text, replyMarkup);
+  else await tgSendMessage(env, chatId, text, true, replyMarkup);
+}
+
+async function sendCitiesPage(
+  env: Env,
+  user: UserConfig,
+  chatId: number,
+  page: number,
+  edit: boolean,
+  messageId?: number
+): Promise<void> {
+  const totalPages = Math.max(1, Math.ceil(CITY_PRESETS.length / CITY_PAGE_SIZE));
+  const p = Math.min(Math.max(0, page), totalPages - 1);
+  const start = p * CITY_PAGE_SIZE;
+  const slice = CITY_PRESETS.slice(start, start + CITY_PAGE_SIZE);
+
+  const selected = new Set(user.includeKeywords.map((k) => normalize(k)));
+
+  const keyboard: any[][] = [];
+  for (const c of slice) {
+    const on = selected.has(normalize(c.name));
+    keyboard.push([{ text: `${on ? "[x]" : "[ ]"} ${c.name}`, callback_data: `city_toggle:${c.id}:${p}` }]);
+  }
+
+  const navRow: any[] = [];
+  if (p > 0) navRow.push({ text: "Anterior", callback_data: `wiz:cities:${p - 1}` });
+  navRow.push({ text: `${p + 1}/${totalPages}`, callback_data: `wiz:cities:${p}` });
+  if (p < totalPages - 1) navRow.push({ text: "Siguiente", callback_data: `wiz:cities:${p + 1}` });
+  keyboard.push(navRow);
+  keyboard.push([{ text: "Ultimas 5", callback_data: "wiz:latest" }]);
+  keyboard.push([{ text: "Menu", callback_data: "wiz:main" }]);
+
+  const selectedLabel = user.includeKeywords.length ? user.includeKeywords.slice(0, 6).join(", ") : "(ninguna)";
+  const text = ["Ciudades", "", "Elige una o varias ciudades. Te enviaremos temas y actualizaciones relacionadas.", "", `Seleccionadas: ${selectedLabel}`].join("\n");
+
+  const replyMarkup = { inline_keyboard: keyboard };
+  if (edit && messageId) await tgEditMessage(env, chatId, messageId, text, replyMarkup);
+  else await tgSendMessage(env, chatId, text, true, replyMarkup);
+}
+
+async function sendLatestWithButtons(env: Env, user: UserConfig, chatId: number, limit: number): Promise<void> {
+  const items = (await getLatestForUser(env, user)).slice(0, limit);
+  if (items.length === 0) {
+    await tgSendMessage(env, chatId, "No encontre publicaciones con tus filtros.", true, {
+      inline_keyboard: [[{ text: "Menu", callback_data: "wiz:main" }]]
+    });
+    return;
+  }
+
+  const token = randomTokenHex(6);
+  const pickKey = `pick:${chatId}:${token}`;
+  await env.KV.put(pickKey, JSON.stringify({ chatId, urls: items.map((t) => t.url) }), { expirationTtl: PICKS_TTL_SEC });
+
+  const lines: string[] = [];
+  lines.push(`Ultimas ${items.length} segun tus filtros:`);
+  for (let i = 0; i < items.length; i++) {
+    lines.push(`${i + 1}. ${formatThreadListLine(items[i])}`);
+  }
+  lines.push("");
+  lines.push("Toca Abrir para ver el link o Leer para un extracto.");
+
+  const keyboard: any[][] = [];
+  for (let i = 0; i < items.length; i++) {
+    keyboard.push([
+      { text: `Abrir ${i + 1}`, url: items[i].url },
+      { text: `Leer ${i + 1}`, callback_data: `readpick:${token}:${i}` }
+    ]);
+  }
+  keyboard.push([{ text: "Actualizar", callback_data: "wiz:latest" }, { text: "Menu", callback_data: "wiz:main" }]);
+
+  await tgSendMessage(env, chatId, lines.join("\n"), true, { inline_keyboard: keyboard });
+}
+
+function formatThreadListLine(t: ThreadItem): string {
+  const head: string[] = [];
+  if (t.forum?.name) head.push(`[${t.forum.name}]`);
+  if (t.prefix) head.push(`[${t.prefix}]`);
+  head.push(t.title);
+  return truncate(head.join(" "), 140);
+}
+
+function truncate(s: string, max: number): string {
+  const text = String(s ?? "");
+  if (text.length <= max) return text;
+  if (max <= 3) return text.slice(0, max);
+  return text.slice(0, Math.max(0, max - 3)).trimEnd() + "...";
+}
+
+function randomTokenHex(bytes: number): string {
+  const buf = new Uint8Array(bytes);
+  crypto.getRandomValues(buf);
+  return Array.from(buf)
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
 async function sendForumsPage(
   env: Env,
   user: UserConfig,
@@ -730,11 +1150,10 @@ async function sendForumsPage(
   if (p < totalPages - 1) navRow.push({ text: "Siguiente", callback_data: `forums_page:${p + 1}` });
   keyboard.push(navRow);
   keyboard.push([{ text: "Actualizar lista", callback_data: "refresh_forums" }]);
+  keyboard.push([{ text: "Ultimas 5", callback_data: "wiz:latest" }]);
+  keyboard.push([{ text: "Menu", callback_data: "wiz:main" }]);
 
-  const text =
-    `Foros (${forums.length}).\n` +
-    `Suscripciones actuales: ${user.forums.length}\n\n` +
-    `Tip: tambien puedes usar /addforum <URL> si un foro no aparece aqui.`;
+  const text = ["Foros", "", "Toca para suscribirte o quitar.", `Suscritos: ${user.forums.length}`].join("\n");
 
   const replyMarkup = { inline_keyboard: keyboard };
 
@@ -801,7 +1220,17 @@ function formatUserConfig(u: UserConfig): string {
 }
 
 function normalize(s: string): string {
-  return String(s ?? "").trim().toLowerCase();
+  const raw = String(s ?? "");
+  const noMarks = stripDiacritics(raw);
+  return noMarks.trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+function stripDiacritics(s: string): string {
+  try {
+    return s.normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+  } catch {
+    return s;
+  }
 }
 
 function nowSec(): number {
