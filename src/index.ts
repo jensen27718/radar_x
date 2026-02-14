@@ -41,6 +41,11 @@ type UserConfig = {
   notifyReplies: boolean;
   notifyReviews: boolean;
   notifyDonations: boolean;
+
+  // Feed scheduling (best-effort). The cron runs every 5 minutes, but each user gets a random delay.
+  feedNextAt?: number; // epoch seconds
+  feedDelivered?: string[]; // recent event keys to avoid repeats
+  feedRecentThreadIds?: number[]; // recent thread ids to avoid immediate repeats
 };
 
 type ThreadItem = {
@@ -75,6 +80,16 @@ type PollState = {
   updatedAt: number;
   home?: HomeState;
   forums: Record<string, ForumState>;
+
+  // Feed pool for "push" alerts (new + old items). Newest-first.
+  events?: FeedEvent[];
+};
+
+type FeedEvent = {
+  v: 1;
+  kind: "thread" | "reply" | "seed";
+  thread: ThreadItem;
+  seenAt: number; // epoch seconds when detected/seeded
 };
 
 type ReviewItem = {
@@ -129,6 +144,13 @@ const DEFAULT_LATEST_RESULT_LIMIT = 10;
 const FORUM_PATHS = ["/foros/", "/forums/"];
 const THREAD_PATHS = ["/temas/", "/threads/"];
 
+const FEED_MIN_DELAY_MIN = 5;
+const FEED_MAX_DELAY_MIN = 60;
+const FEED_EVENTS_MAX = 550;
+const FEED_DELIVERED_MAX = 140;
+const FEED_RECENT_THREAD_MAX = 70;
+const FEED_MAX_SENDS_PER_RUN = 18;
+
 const CITY_PRESETS: { id: string; name: string }[] = [
   { id: "bogota", name: "Bogota" },
   { id: "medellin", name: "Medellin" },
@@ -165,6 +187,10 @@ export default {
 
     if (request.method === "GET" && url.pathname === "/") {
       return new Response("ok", { status: 200 });
+    }
+
+    if (request.method === "GET" && url.pathname === "/leer") {
+      return handleReadPage(request, env);
     }
 
     if (request.method === "GET" && url.pathname === "/donar") {
@@ -241,6 +267,51 @@ async function getPollState(env: Env): Promise<PollState | null> {
     next.home = { v: 1, updatedAt: typeof (s.home as any).updatedAt === "number" ? (s.home as any).updatedAt : 0, threadIds: ids, threads };
   }
 
+  const eventsRaw = (s as any).events;
+  if (Array.isArray(eventsRaw)) {
+    const out: FeedEvent[] = [];
+    for (const e of eventsRaw) {
+      if (!e || typeof e !== "object") continue;
+      const kind = String((e as any).kind ?? "");
+      if (kind !== "thread" && kind !== "reply" && kind !== "seed") continue;
+      const t = (e as any).thread;
+      if (!t || typeof t !== "object") continue;
+      const id = Number((t as any).id);
+      const title = String((t as any).title ?? "");
+      const url = String((t as any).url ?? "");
+      if (!Number.isFinite(id) || id <= 0 || !url) continue;
+
+      const updatedAtRaw = (t as any).updatedAt;
+      const updatedAt = typeof updatedAtRaw === "number" && Number.isFinite(updatedAtRaw) ? updatedAtRaw : undefined;
+
+      const source = (t as any).source === "forum" ? "forum" : "home";
+
+      const forum = (t as any).forum;
+      const forumOk =
+        forum &&
+        typeof forum === "object" &&
+        typeof (forum as any).id === "number" &&
+        typeof (forum as any).name === "string" &&
+        typeof (forum as any).url === "string";
+
+      out.push({
+        v: 1,
+        kind: kind as any,
+        thread: {
+          id,
+          title: title || `Tema ${id}`,
+          url,
+          forum: forumOk ? (forum as ForumRef) : undefined,
+          prefix: typeof (t as any).prefix === "string" ? (t as any).prefix : undefined,
+          updatedAt,
+          source
+        },
+        seenAt: typeof (e as any).seenAt === "number" ? (e as any).seenAt : 0
+      });
+    }
+    if (out.length) next.events = out.slice(0, FEED_EVENTS_MAX);
+  }
+
   return next;
 }
 
@@ -286,6 +357,9 @@ async function runScheduledPoll(env: Env, scheduledTimeMs: number): Promise<void
     await env.KV.put(POLL_STATE_KEY, JSON.stringify(state));
   }
 
+  // User feed (push) notifications with random per-user delay (5-60 min).
+  await runUserFeedNotifications(env, state, users, scheduledTimeMs);
+
   // Donation nudges (opt-out). Runs very occasionally to avoid spam.
   await maybeSendDonationReminders(env, users, scheduledTimeMs);
 }
@@ -319,8 +393,25 @@ async function pollForumAndNotify(
       threads: buildThreadStateMap(threads)
     };
     state.forums[forumKey] = primed;
+    // Seed a few old items so user feeds can still send "cositas antiguas".
+    addFeedEvents(
+      state,
+      threads.slice(0, 12).map((t) => ({ v: 1 as const, kind: "seed" as const, thread: t, seenAt: nowSec }))
+    );
     return true;
   }
+
+  // Migration/backfill: if the feed pool doesn't have items for this forum yet, add a few seeds.
+  const needSeed =
+    !Array.isArray(state.events) ||
+    state.events.length === 0 ||
+    !state.events.some((e) => e && e.thread && e.thread.forum && e.thread.forum.id === forum.id);
+  const seeded = needSeed
+    ? addFeedEvents(
+        state,
+        threads.slice(0, 12).map((t) => ({ v: 1 as const, kind: "seed" as const, thread: t, seenAt: t.updatedAt ?? nowSec }))
+      )
+    : false;
 
   const next: ForumState = {
     v: 1,
@@ -361,23 +452,15 @@ async function pollForumAndNotify(
   const changed = !shallowEqualRecords(existing.threads, next.threads);
   if (changed) state.forums[forumKey] = next;
 
-  for (const t of newThreadEvents) {
-    for (const u of subscribers) {
-      if (!u.notifyThreads) continue;
-      if (!matchesUserFilters(u, t)) continue;
-      await tgSendMessage(env, u.chatId, formatThreadNotification("Nuevo tema", t), true);
-    }
-  }
+  const eventsAdded = addFeedEvents(
+    state,
+    [
+      ...newThreadEvents.map((t) => ({ v: 1 as const, kind: "thread" as const, thread: t, seenAt: nowSec })),
+      ...updatedThreadEvents.map((t) => ({ v: 1 as const, kind: "reply" as const, thread: t, seenAt: nowSec }))
+    ]
+  );
 
-  for (const t of updatedThreadEvents) {
-    for (const u of subscribers) {
-      if (!u.notifyReplies) continue;
-      if (!matchesUserFilters(u, t)) continue;
-      await tgSendMessage(env, u.chatId, formatThreadNotification("Nueva respuesta", t), true);
-    }
-  }
-
-  return changed;
+  return changed || eventsAdded || seeded;
 }
 
 async function pollHomeAndNotify(env: Env, state: PollState, subscribers: UserConfig[], nowMs: number): Promise<boolean> {
@@ -396,8 +479,25 @@ async function pollHomeAndNotify(env: Env, state: PollState, subscribers: UserCo
       threads: buildThreadStateMap(threads)
     };
     state.home = primed;
+    // Seed a few old items so user feeds can still send "cositas antiguas".
+    addFeedEvents(
+      state,
+      threads.slice(0, 12).map((t) => ({ v: 1 as const, kind: "seed" as const, thread: t, seenAt: nowSec }))
+    );
     return true;
   }
+
+  // Migration/backfill: if the feed pool doesn't have any home items yet, add a few seeds.
+  const needSeed =
+    !Array.isArray(state.events) ||
+    state.events.length === 0 ||
+    !state.events.some((e) => e && e.thread && e.thread.source === "home");
+  const seeded = needSeed
+    ? addFeedEvents(
+        state,
+        threads.slice(0, 12).map((t) => ({ v: 1 as const, kind: "seed" as const, thread: t, seenAt: t.updatedAt ?? nowSec }))
+      )
+    : false;
 
   const next: HomeState = {
     v: 1,
@@ -437,32 +537,284 @@ async function pollHomeAndNotify(env: Env, state: PollState, subscribers: UserCo
   const changed = !arrayEqual(existing.threadIds, next.threadIds) || !shallowEqualRecords(existing.threads ?? {}, next.threads);
   if (changed) state.home = next;
 
-  for (const t of newThreadEvents) {
-    for (const u of subscribers) {
-      if (!u.notifyThreads) continue;
-      if (!matchesUserFilters(u, t)) continue;
-      await tgSendMessage(env, u.chatId, formatThreadNotification("Nuevo tema", t), true);
+  const eventsAdded = addFeedEvents(
+    state,
+    [
+      ...newThreadEvents.map((t) => ({ v: 1 as const, kind: "thread" as const, thread: t, seenAt: nowSec })),
+      ...updatedThreadEvents.map((t) => ({ v: 1 as const, kind: "reply" as const, thread: t, seenAt: nowSec }))
+    ]
+  );
+
+  return changed || eventsAdded || seeded;
+}
+
+function feedEventKey(e: FeedEvent): string {
+  // Key ignores kind so "seed" does not duplicate a real event of the same thread+timestamp.
+  const updated = e.thread.updatedAt ?? 0;
+  return `${e.thread.id}:${updated}`;
+}
+
+function feedKindPriority(kind: FeedEvent["kind"]): number {
+  if (kind === "reply") return 2;
+  if (kind === "thread") return 1;
+  return 0; // seed
+}
+
+function addFeedEvents(state: PollState, incoming: FeedEvent[]): boolean {
+  if (!incoming || incoming.length === 0) return false;
+  const existing = Array.isArray(state.events) ? state.events : [];
+
+  // Index existing by key for upgrades (seed -> thread/reply).
+  const idxByKey = new Map<string, number>();
+  for (let i = 0; i < existing.length; i++) idxByKey.set(feedEventKey(existing[i]), i);
+
+  const toPrepend: FeedEvent[] = [];
+  let changed = false;
+
+  for (const e of incoming) {
+    if (!e || typeof e !== "object") continue;
+    if (!e.thread || typeof e.thread !== "object") continue;
+    if (!Number.isFinite(e.thread.id) || e.thread.id <= 0) continue;
+    if (!e.thread.url) continue;
+
+    const key = feedEventKey(e);
+    const idx = idxByKey.get(key);
+    if (idx === undefined) {
+      toPrepend.push(e);
+      idxByKey.set(key, -1); // prevent duplicates within the same batch
+      changed = true;
+      continue;
+    }
+
+    if (idx < 0) continue; // already added from this batch
+
+    const cur = existing[idx];
+    const curPri = feedKindPriority(cur.kind);
+    const nextPri = feedKindPriority(e.kind);
+
+    const mergedThread: ThreadItem = {
+      ...cur.thread,
+      ...e.thread,
+      // Keep best-effort optional fields.
+      forum: e.thread.forum ?? cur.thread.forum,
+      prefix: e.thread.prefix ?? cur.thread.prefix,
+      updatedAt: e.thread.updatedAt ?? cur.thread.updatedAt
+    };
+
+    const merged: FeedEvent = {
+      ...cur,
+      kind: nextPri > curPri ? e.kind : cur.kind,
+      thread: mergedThread,
+      seenAt: Math.max(cur.seenAt ?? 0, e.seenAt ?? 0)
+    };
+
+    if (merged.kind !== cur.kind || merged.seenAt !== cur.seenAt || merged.thread.title !== cur.thread.title) {
+      existing[idx] = merged;
+      changed = true;
     }
   }
 
-  for (const t of updatedThreadEvents) {
-    for (const u of subscribers) {
-      if (!u.notifyReplies) continue;
-      if (!matchesUserFilters(u, t)) continue;
-      await tgSendMessage(env, u.chatId, formatThreadNotification("Nueva respuesta", t), true);
-    }
-  }
-
+  const next = toPrepend.length ? [...toPrepend, ...existing] : existing;
+  const pruned = next.slice(0, FEED_EVENTS_MAX);
+  state.events = pruned;
   return changed;
 }
 
+function hasPositiveFilters(u: UserConfig): boolean {
+  return (u.includeKeywords?.length ?? 0) > 0 || (u.forums?.length ?? 0) > 0 || (u.prefixes?.length ?? 0) > 0;
+}
+
+function isUserFeedEnabled(u: UserConfig): boolean {
+  // If the user has no positive filters, don't spam them with the whole site.
+  if (!hasPositiveFilters(u)) return false;
+  return Boolean(u.notifyThreads || u.notifyReplies);
+}
+
+function userWantsFeedEvent(u: UserConfig, e: FeedEvent): boolean {
+  if (e.kind === "reply") return Boolean(u.notifyReplies);
+  return Boolean(u.notifyThreads);
+}
+
+function randomIntInRange(min: number, max: number): number {
+  const a = Math.ceil(min);
+  const b = Math.floor(max);
+  if (!Number.isFinite(a) || !Number.isFinite(b)) return a;
+  if (b <= a) return a;
+  const span = b - a + 1;
+  const buf = new Uint32Array(1);
+  crypto.getRandomValues(buf);
+  return a + (buf[0] % span);
+}
+
+function scheduleNextFeedAt(nowSec: number): number {
+  const mins = randomIntInRange(FEED_MIN_DELAY_MIN, FEED_MAX_DELAY_MIN);
+  return nowSec + mins * 60;
+}
+
+function scheduleFeedSoonAt(nowSec: number): number {
+  const upper = Math.min(FEED_MIN_DELAY_MIN + 10, FEED_MAX_DELAY_MIN);
+  const mins = randomIntInRange(FEED_MIN_DELAY_MIN, upper);
+  return nowSec + mins * 60;
+}
+
+async function runUserFeedNotifications(env: Env, state: PollState, users: UserConfig[], nowMs: number): Promise<void> {
+  const now = Math.floor(nowMs / 1000);
+  const events = Array.isArray(state.events) ? state.events : [];
+  if (events.length === 0) return;
+
+  let sent = 0;
+  for (const u of users) {
+    if (sent >= FEED_MAX_SENDS_PER_RUN) break;
+    if (!isUserFeedEnabled(u)) continue;
+
+    const nextAt = typeof u.feedNextAt === "number" ? u.feedNextAt : 0;
+    if (!nextAt || nextAt <= 0) {
+      // First-time schedule: don't send immediately, keep the 5-60 min rhythm.
+      await putUser(env, { ...u, feedNextAt: scheduleFeedSoonAt(now), feedDelivered: u.feedDelivered ?? [], feedRecentThreadIds: u.feedRecentThreadIds ?? [] });
+      continue;
+    }
+
+    if (nextAt > now) continue;
+
+    const delivered = Array.isArray(u.feedDelivered) ? u.feedDelivered : [];
+    const deliveredSet = new Set(delivered);
+    const recent = Array.isArray(u.feedRecentThreadIds) ? u.feedRecentThreadIds : [];
+    const recentSet = new Set(recent);
+
+    let picked: FeedEvent | null = null;
+    let isRepeat = false;
+
+    // Prefer unseen "thread/reply" events first (newest-first).
+    for (const e of events) {
+      if (e.kind === "seed") continue;
+      if (!userWantsFeedEvent(u, e)) continue;
+      if (!matchesUserFilters(u, e.thread)) continue;
+      const key = feedEventKey(e);
+      if (deliveredSet.has(key)) continue;
+      if (recentSet.has(e.thread.id)) continue;
+      picked = e;
+      break;
+    }
+
+    // If there were no real events, allow seeded items.
+    if (!picked) {
+      for (const e of events) {
+        if (e.kind !== "seed") continue;
+        if (!userWantsFeedEvent(u, e)) continue;
+        if (!matchesUserFilters(u, e.thread)) continue;
+        const key = feedEventKey(e);
+        if (deliveredSet.has(key)) continue;
+        if (recentSet.has(e.thread.id)) continue;
+        picked = e;
+        break;
+      }
+    }
+
+    if (!picked) {
+      // No new stuff for this user's filters. Send something older (but avoid immediate repeats).
+      const pool: FeedEvent[] = [];
+      for (const e of events) {
+        if (!userWantsFeedEvent(u, e)) continue;
+        if (!matchesUserFilters(u, e.thread)) continue;
+        if (recentSet.has(e.thread.id)) continue;
+        pool.push(e);
+      }
+      if (pool.length > 0) {
+        picked = pool[randomIntInRange(0, pool.length - 1)];
+        isRepeat = true;
+      }
+    }
+
+    if (!picked) {
+      // If the filter is very narrow, allow repeats even if it's the same thread again.
+      const pool: FeedEvent[] = [];
+      for (const e of events) {
+        if (!userWantsFeedEvent(u, e)) continue;
+        if (!matchesUserFilters(u, e.thread)) continue;
+        pool.push(e);
+      }
+      if (pool.length > 0) {
+        picked = pool[randomIntInRange(0, pool.length - 1)];
+        isRepeat = true;
+      }
+    }
+
+    const nextAt2 = scheduleNextFeedAt(now);
+
+    if (!picked) {
+      // Still nothing; just reschedule to avoid tight loops.
+      await putUser(env, { ...u, feedNextAt: nextAt2, feedDelivered: delivered.slice(-FEED_DELIVERED_MAX), feedRecentThreadIds: recent.slice(-FEED_RECENT_THREAD_MAX) });
+      continue;
+    }
+
+    await sendFeedThreadAlert(env, u.chatId, picked, { isRepeat });
+
+    const nextDelivered = [...delivered, feedEventKey(picked)];
+    const trimmedDelivered = nextDelivered.slice(Math.max(0, nextDelivered.length - FEED_DELIVERED_MAX));
+
+    const nextRecent = [...recent, picked.thread.id];
+    const trimmedRecent = nextRecent.slice(Math.max(0, nextRecent.length - FEED_RECENT_THREAD_MAX));
+
+    await putUser(env, { ...u, feedNextAt: nextAt2, feedDelivered: trimmedDelivered, feedRecentThreadIds: trimmedRecent });
+    sent++;
+  }
+}
+
+async function sendFeedThreadAlert(
+  env: Env,
+  chatId: number,
+  e: FeedEvent,
+  opts: { isRepeat: boolean }
+): Promise<void> {
+  const t = e.thread;
+
+  const label =
+    opts.isRepeat || e.kind === "seed" ? "Pa que no se le pase" : e.kind === "reply" ? "Nueva respuesta" : "Nuevo tema";
+  const lines: string[] = [];
+
+  lines.push(`Pilas pues: ${label}${t.forum?.name ? ` en ${t.forum.name}` : ""}`);
+
+  const head: string[] = [];
+  if (t.prefix) head.push(`[${t.prefix}]`);
+  head.push(t.title);
+  lines.push(truncate(head.join(" "), 220));
+
+  if (t.updatedAt && t.updatedAt > 0) {
+    lines.push(`Fecha: ${formatCoDateTimeFromSec(t.updatedAt)}`);
+  }
+
+  // Keep the URL in the message so Telegram can show previews if the photo path fails.
+  lines.push(t.url);
+  const text = lines.join("\n");
+
+  const base = publicBaseUrl(env);
+  const row = base
+    ? [{ text: "Abrir", url: t.url }, { text: "Leer", url: `${base}/leer?u=${encodeURIComponent(t.url)}` }]
+    : [{ text: "Abrir", url: t.url }];
+  const keyboard = { inline_keyboard: [row] };
+
+  const html = await fetchTextWithTimeout(t.url, 6500);
+  const imageUrl = html ? extractBestImageUrl(html, t.url) : null;
+
+  if (imageUrl) {
+    const caption = truncate(text, 900);
+    const ok = await tgSendPhoto(env, chatId, imageUrl, caption, keyboard);
+    if (ok) return;
+  }
+
+  // Web preview ON (if the page has og:image, Telegram usually shows it).
+  await tgSendMessage(env, chatId, text, false, keyboard);
+}
+
 function matchesUserFilters(u: UserConfig, t: ThreadItem): boolean {
-  if (u.forums.length > 0 && t.forum) {
-    const ok = u.forums.some((f) => f.id === t.forum!.id);
+  const forum = t.forum;
+  if (u.forums.length > 0) {
+    if (!forum) return false;
+    const ok = u.forums.some((f) => f.id === forum.id);
     if (!ok) return false;
   }
 
-  const text = normalize(`${t.title} ${t.prefix ?? ""} ${t.forum?.name ?? ""}`);
+  const text = normalize(`${t.title} ${t.prefix ?? ""} ${forum?.name ?? ""}`);
 
   for (const k of u.excludeKeywords) {
     if (!k) continue;
@@ -488,8 +840,7 @@ function formatThreadNotification(kind: string, t: ThreadItem): string {
   parts.push(`Pilas pues: ${kind}${t.forum?.name ? ` en ${t.forum.name}` : ""}`);
   parts.push(`${t.prefix ? `[${t.prefix}] ` : ""}${t.title}`);
   if (t.updatedAt && t.updatedAt > 0) {
-    const iso = new Date(t.updatedAt * 1000).toISOString().replace(".000Z", "Z");
-    parts.push(`Actualizado: ${iso}`);
+    parts.push(`Fecha: ${formatCoDateTimeFromSec(t.updatedAt)}`);
   }
   parts.push(`Abrir: ${t.url}`);
   return parts.join("\n");
@@ -535,10 +886,9 @@ async function handleTelegramMessage(message: any, env: Env): Promise<void> {
       const user = await ensureUser(env, chatId);
       const forum = await resolveForumFromArg(env, pastedUrl);
       if (forum) {
-        const next = addForum(user, forum);
+        const next = bumpFeedAfterFilterChange(addForum(user, forum));
         await putUser(env, next);
-        await tgSendMessage(env, chatId, `Listo pues, quedo suscrito a: ${forum.name}`, true);
-        await sendLatestWithButtons(env, next, chatId, 5);
+        await tgSendMessage(env, chatId, `Listo pues, quedo suscrito a: ${forum.name}\n\nYa quedo prendido. Le mando cositas cada ratico.`, true);
         return;
       }
 
@@ -593,10 +943,9 @@ async function handleTelegramMessage(message: any, env: Env): Promise<void> {
       );
       return;
     }
-    const next = addForum(user, forum);
+    const next = bumpFeedAfterFilterChange(addForum(user, forum));
     await putUser(env, next);
-    await tgSendMessage(env, chatId, `Listo pues, quedo suscrito a: ${forum.name}`, true);
-    await sendLatestWithButtons(env, next, chatId, 5);
+    await tgSendMessage(env, chatId, `Listo pues, quedo suscrito a: ${forum.name}\n\nYa quedo prendido. Le mando cositas cada ratico.`, true);
     return;
   }
 
@@ -606,10 +955,9 @@ async function handleTelegramMessage(message: any, env: Env): Promise<void> {
       await tgSendMessage(env, chatId, "Parce, asi es: /rmforum <id>  (ej: /rmforum 18)", true);
       return;
     }
-    const next = { ...user, forums: user.forums.filter((f) => f.id !== forumId), updatedAt: nowSec() };
+    const next = bumpFeedAfterFilterChange({ ...user, forums: user.forums.filter((f) => f.id !== forumId), updatedAt: nowSec() });
     await putUser(env, next);
     await tgSendMessage(env, chatId, `Listo, quite el foro: ${forumId}`, true);
-    await sendLatestWithButtons(env, next, chatId, 5);
     return;
   }
 
@@ -619,10 +967,9 @@ async function handleTelegramMessage(message: any, env: Env): Promise<void> {
       await tgSendMessage(env, chatId, "Listo, pero digame la palabra o frase. Ej: /addkw bogota", true);
       return;
     }
-    const next = addUnique(user, "includeKeywords", kw);
+    const next = bumpFeedAfterFilterChange(addUnique(user, "includeKeywords", kw));
     await putUser(env, next);
     await tgSendMessage(env, chatId, `De una, agregue: ${kw}`, true);
-    await sendLatestWithButtons(env, next, chatId, 5);
     return;
   }
 
@@ -632,10 +979,9 @@ async function handleTelegramMessage(message: any, env: Env): Promise<void> {
       await tgSendMessage(env, chatId, "Listo, pero cual quitamos? Ej: /rmkw bogota", true);
       return;
     }
-    const next = removeValue(user, "includeKeywords", kw);
+    const next = bumpFeedAfterFilterChange(removeValue(user, "includeKeywords", kw));
     await putUser(env, next);
     await tgSendMessage(env, chatId, `Listo, quite: ${kw}`, true);
-    await sendLatestWithButtons(env, next, chatId, 5);
     return;
   }
 
@@ -645,10 +991,9 @@ async function handleTelegramMessage(message: any, env: Env): Promise<void> {
       await tgSendMessage(env, chatId, "Listo, que quiere excluir? Ej: /addnot politica", true);
       return;
     }
-    const next = addUnique(user, "excludeKeywords", kw);
+    const next = bumpFeedAfterFilterChange(addUnique(user, "excludeKeywords", kw));
     await putUser(env, next);
     await tgSendMessage(env, chatId, `Hecho, ahora excluyo: ${kw}`, true);
-    await sendLatestWithButtons(env, next, chatId, 5);
     return;
   }
 
@@ -658,10 +1003,9 @@ async function handleTelegramMessage(message: any, env: Env): Promise<void> {
       await tgSendMessage(env, chatId, "Listo, cual exclusion quitamos? Ej: /rmnot politica", true);
       return;
     }
-    const next = removeValue(user, "excludeKeywords", kw);
+    const next = bumpFeedAfterFilterChange(removeValue(user, "excludeKeywords", kw));
     await putUser(env, next);
     await tgSendMessage(env, chatId, `Listo, ya no excluyo: ${kw}`, true);
-    await sendLatestWithButtons(env, next, chatId, 5);
     return;
   }
 
@@ -671,10 +1015,9 @@ async function handleTelegramMessage(message: any, env: Env): Promise<void> {
       await tgSendMessage(env, chatId, "Listo, pero cual prefijo? Ej: /addprefix Resena", true);
       return;
     }
-    const next = addUnique(user, "prefixes", p);
+    const next = bumpFeedAfterFilterChange(addUnique(user, "prefixes", p));
     await putUser(env, next);
     await tgSendMessage(env, chatId, `Hecho, prefijo: ${p}`, true);
-    await sendLatestWithButtons(env, next, chatId, 5);
     return;
   }
 
@@ -684,10 +1027,9 @@ async function handleTelegramMessage(message: any, env: Env): Promise<void> {
       await tgSendMessage(env, chatId, "Listo, cual prefijo quitamos? Ej: /rmprefix Resena", true);
       return;
     }
-    const next = removeValue(user, "prefixes", p);
+    const next = bumpFeedAfterFilterChange(removeValue(user, "prefixes", p));
     await putUser(env, next);
     await tgSendMessage(env, chatId, `Listo, quite el prefijo: ${p}`, true);
-    await sendLatestWithButtons(env, next, chatId, 5);
     return;
   }
 
@@ -732,11 +1074,6 @@ async function handleTelegramMessage(message: any, env: Env): Promise<void> {
       return;
     }
     await handleReadCommand(env, chatId, url);
-    return;
-  }
-
-  if (name === "latest" || name === "ultimos") {
-    await sendLatestWithButtons(env, user, chatId, 5);
     return;
   }
 
@@ -811,10 +1148,10 @@ async function handleTelegramCallback(cb: any, env: Env): Promise<void> {
       if (hits.length === 1) next = addForum(next, hits[0]);
     }
 
+    next = bumpFeedAfterFilterChange(next);
     await putUser(env, next);
     if (messageId) await sendCitiesPage(env, next, chatId, Number.isFinite(page) ? page : 0, true, messageId);
     await tgAnswerCallback(env, cb.id, "De una");
-    await sendLatestWithButtons(env, next, chatId, 5);
     return;
   }
 
@@ -1024,14 +1361,8 @@ async function handleTelegramCallback(cb: any, env: Env): Promise<void> {
       return;
     }
 
-    if (action === "latest") {
-      await tgAnswerCallback(env, cb.id, "Ya casi...");
-      await sendLatestWithButtons(env, user, chatId, 5);
-      return;
-    }
-
     if (action === "reset") {
-      const next: UserConfig = {
+      const next: UserConfig = bumpFeedAfterFilterChange({
         ...user,
         forums: [],
         includeKeywords: [],
@@ -1042,11 +1373,10 @@ async function handleTelegramCallback(cb: any, env: Env): Promise<void> {
         notifyReviews: true,
         notifyDonations: true,
         updatedAt: nowSec()
-      };
+      });
       await putUser(env, next);
       if (messageId) await sendMainMenu(env, next, chatId, true, messageId);
       await tgAnswerCallback(env, cb.id, "Listo");
-      await sendLatestWithButtons(env, next, chatId, 5);
       return;
     }
   }
@@ -1072,21 +1402,19 @@ async function handleTelegramCallback(cb: any, env: Env): Promise<void> {
       await tgAnswerCallback(env, cb.id, "No pude encontrar ese foro");
       return;
     }
-    const next = addForum(user, forum);
+    const next = bumpFeedAfterFilterChange(addForum(user, forum));
     await putUser(env, next);
     await sendForumsPage(env, next, chatId, 0, true, cb.message?.message_id);
     await tgAnswerCallback(env, cb.id, "Listo, suscrito");
-    await sendLatestWithButtons(env, next, chatId, 5);
     return;
   }
 
   if (data.startsWith("unsub_forum:")) {
     const forumId = parseInt(data.split(":")[1] ?? "", 10);
-    const next = { ...user, forums: user.forums.filter((f) => f.id !== forumId), updatedAt: nowSec() };
+    const next = bumpFeedAfterFilterChange({ ...user, forums: user.forums.filter((f) => f.id !== forumId), updatedAt: nowSec() });
     await putUser(env, next);
     await sendForumsPage(env, next, chatId, 0, true, cb.message?.message_id);
     await tgAnswerCallback(env, cb.id, "Listo, quitado");
-    await sendLatestWithButtons(env, next, chatId, 5);
     return;
   }
 
@@ -1155,6 +1483,15 @@ async function handleReadCommand(env: Env, chatId: number, urlRaw: string): Prom
     extractTitleTag(html) ??
     url.toString();
 
+  const imageUrl = extractBestImageUrl(html, url.toString());
+  if (imageUrl) {
+    const ok = await tgSendPhoto(env, chatId, imageUrl, truncate(title, 900));
+    if (!ok) {
+      // As a fallback, allow Telegram to preview the image URL.
+      await tgSendMessage(env, chatId, `Imagen: ${imageUrl}`, false);
+    }
+  }
+
   const ogDesc = extractMetaProperty(html, "og:description");
   const body = extractFirstPostText(html);
   const content = preferLonger(ogDesc, body);
@@ -1164,6 +1501,79 @@ async function handleReadCommand(env: Env, chatId: number, urlRaw: string): Prom
     : `${title}\n\n${url.toString()}`;
 
   await tgSendLongMessage(env, chatId, text, true);
+}
+
+async function handleReadPage(request: Request, env: Env): Promise<Response> {
+  const url = new URL(request.url);
+  const targetRaw = String(url.searchParams.get("u") ?? "").trim();
+  if (!targetRaw) return htmlResponse("Bad Request", 400);
+
+  let target: URL;
+  try {
+    target = new URL(targetRaw, env.SITE_BASE_URL);
+  } catch {
+    return htmlResponse("Bad Request", 400);
+  }
+
+  const base = new URL(env.SITE_BASE_URL);
+  if (target.hostname !== base.hostname) return htmlResponse("Forbidden", 403);
+
+  const html = await fetchTextWithTimeout(target.toString(), 9000);
+  if (!html) return htmlResponse("No pude abrir esa pagina.", 502);
+
+  const title =
+    extractMetaProperty(html, "og:title") ??
+    extractTitleTag(html) ??
+    target.toString();
+
+  const ogDesc = extractMetaProperty(html, "og:description");
+  const body = extractFirstPostText(html);
+  const content = preferLonger(ogDesc, body) || "";
+  const imageUrl = extractBestImageUrl(html, target.toString());
+
+  const safeTitle = escapeHtml(title);
+  const safeContent = escapeHtml(content);
+  const safeTarget = escapeHtml(target.toString());
+
+  const imgHtml = imageUrl
+    ? `<div class="imgWrap"><img src="${escapeHtml(imageUrl)}" alt="imagen"/></div>`
+    : "";
+
+  const page = `<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1"/>
+    <meta name="robots" content="noindex"/>
+    <title>${safeTitle}</title>
+    <style>
+      :root { --bg:#070a12; --card:#0d1323; --txt:#f2f6ff; --mut:#b6c0dd; --line:rgba(255,255,255,.10); --acc:#25c38b; }
+      body { margin:0; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial; background: radial-gradient(1000px 600px at 18% 10%, rgba(37,195,139,.15), transparent 60%), var(--bg); color: var(--txt); }
+      main { max-width: 920px; margin: 0 auto; padding: 26px 16px 44px; }
+      .card { background: linear-gradient(180deg, rgba(255,255,255,.07), rgba(255,255,255,.03)); border: 1px solid var(--line); border-radius: 18px; padding: 18px 16px 20px; box-shadow: 0 14px 45px rgba(0,0,0,.35); }
+      h1 { margin:0 0 10px; font-size: 22px; letter-spacing: .2px; }
+      .meta { color: var(--mut); margin: 0 0 14px; font-size: 13px; }
+      .story { white-space: pre-wrap; line-height: 1.55; color: #e9efff; }
+      a { color: #cfe3ff; }
+      .imgWrap { margin: 0 0 14px; border-radius: 14px; overflow: hidden; border: 1px solid var(--line); background: rgba(0,0,0,.15); }
+      .imgWrap img { width: 100%; height: auto; display:block; }
+      .btn { display:inline-block; margin-top: 12px; background: rgba(37,195,139,.14); border: 1px solid rgba(37,195,139,.35); color: var(--txt); text-decoration:none; padding: 10px 12px; border-radius: 12px; font-weight: 800; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <div class="card">
+        <h1>${safeTitle}</h1>
+        <p class="meta">Fuente: <a href="${safeTarget}">${safeTarget}</a></p>
+        ${imgHtml}
+        <div class="story">${safeContent || "(sin texto)"}</div>
+        <a class="btn" href="${safeTarget}">Abrir original</a>
+      </div>
+    </main>
+  </body>
+</html>`;
+
+  return htmlResponse(page, 200);
 }
 
 function extractMetaProperty(html: string, property: string): string | null {
@@ -1177,6 +1587,85 @@ function extractMetaProperty(html: string, property: string): string | null {
   if (m2?.[1]) return decodeHtmlEntities(m2[1]).trim();
 
   return null;
+}
+
+function extractMetaName(html: string, name: string): string | null {
+  const n = escapeRe(name);
+  const re1 = new RegExp(`<meta\\b[^>]*name=["']${n}["'][^>]*content=["']([^"']+)["'][^>]*>`, "i");
+  const m1 = re1.exec(html);
+  if (m1?.[1]) return decodeHtmlEntities(m1[1]).trim();
+
+  const re2 = new RegExp(`<meta\\b[^>]*content=["']([^"']+)["'][^>]*name=["']${n}["'][^>]*>`, "i");
+  const m2 = re2.exec(html);
+  if (m2?.[1]) return decodeHtmlEntities(m2[1]).trim();
+
+  return null;
+}
+
+function toAbsoluteUrl(raw: string, baseUrl: string): string | null {
+  const s = String(raw ?? "").trim();
+  if (!s) return null;
+  try {
+    const u = new URL(s, baseUrl);
+    if (u.protocol !== "http:" && u.protocol !== "https:") return null;
+    return u.toString();
+  } catch {
+    return null;
+  }
+}
+
+function extractFirstPostHtml(html: string): string | null {
+  const m = /class="bbWrapper"[^>]*>([\s\S]*?)<\/div>/i.exec(html);
+  return m?.[1] ? String(m[1]) : null;
+}
+
+function extractFirstImageUrlFromHtml(fragmentHtml: string, baseUrl: string): string | null {
+  const frag = String(fragmentHtml ?? "");
+  if (!frag) return null;
+
+  const imgRe = /<img\b[^>]*>/gi;
+  let m: RegExpExecArray | null;
+  while ((m = imgRe.exec(frag)) !== null) {
+    const tag = m[0] ?? "";
+    const getAttr = (name: string): string | null => {
+      const re = new RegExp(`${escapeRe(name)}\\s*=\\s*["']([^"']+)["']`, "i");
+      const mm = re.exec(tag);
+      return mm?.[1] ? decodeHtmlEntities(mm[1]).trim() : null;
+    };
+
+    const src =
+      getAttr("data-src") ||
+      getAttr("data-lazy-src") ||
+      getAttr("data-original") ||
+      getAttr("src");
+
+    if (!src) continue;
+    if (src.startsWith("data:")) continue;
+    const abs = toAbsoluteUrl(src, baseUrl);
+    if (abs) return abs;
+  }
+
+  return null;
+}
+
+function extractBestImageUrl(html: string, baseUrl: string): string | null {
+  const og = extractMetaProperty(html, "og:image");
+  const tw = extractMetaName(html, "twitter:image");
+  const meta = og || tw;
+  if (meta) {
+    const abs = toAbsoluteUrl(meta, baseUrl);
+    if (abs) return abs;
+  }
+
+  const firstPost = extractFirstPostHtml(html);
+  if (firstPost) {
+    const abs = extractFirstImageUrlFromHtml(firstPost, baseUrl);
+    if (abs) return abs;
+  }
+
+  // Fallback: any image on the page.
+  const abs = extractFirstImageUrlFromHtml(html, baseUrl);
+  return abs;
 }
 
 function extractTitleTag(html: string): string | null {
@@ -1218,13 +1707,12 @@ async function sendMainMenu(
     `Ciudades/temas: ${selectedTopics}`,
     `Foros: ${user.forums.length}`,
     "",
-    "Pilas: toque un boton y yo le muestro."
+    "Pilas: escoja ciudad/foro y yo le mando cositas cada ratico."
   ].join("\n");
 
   const keyboard: any[][] = [
     [{ text: "Elegir ciudad", callback_data: "wiz:cities:0" }],
     [{ text: "Elegir foros", callback_data: "wiz:forums:0" }],
-    [{ text: "Ultimas 5", callback_data: "wiz:latest" }],
     [{ text: "Resenas", callback_data: "wiz:reviews" }]
   ];
 
@@ -1249,8 +1737,8 @@ async function sendHelpPage(env: Env, user: UserConfig, chatId: number, edit: bo
     "",
     "1) Toque 'Elegir ciudad' y escoja su ciudad (o varias).",
     "2) O toque 'Elegir foros' si quiere afinar mas.",
-    "3) Cada vez que cambie un filtro, le mando las ultimas 5 con Abrir/Leer.",
-    "4) Y cuando salgan temas nuevos o respuestas, le aviso solito.",
+    "3) Con eso ya queda prendido: le voy mandando cosas cada ratico.",
+    "4) Los avisos salen en tiempos aleatorios (entre 5 y 60 min).",
     "5) En 'Resenas' puede ver y publicar resenas por ciudad.",
     "6) Si quiere apoyar el proyecto: toque 'Donar'.",
     "",
@@ -1278,7 +1766,6 @@ async function sendMePage(env: Env, user: UserConfig, chatId: number, edit: bool
 
   const replyMarkup = {
     inline_keyboard: [
-      [{ text: "Ultimas 5", callback_data: "wiz:latest" }],
       [{ text: "Editar ciudades", callback_data: "wiz:cities:0" }],
       [{ text: "Editar foros", callback_data: "wiz:forums:0" }],
       [{ text: "Volver al menu", callback_data: "wiz:main" }]
@@ -1345,7 +1832,6 @@ async function sendCitiesPage(
   navRow.push({ text: `${p + 1}/${totalPages}`, callback_data: `wiz:cities:${p}` });
   if (p < totalPages - 1) navRow.push({ text: "Siguiente", callback_data: `wiz:cities:${p + 1}` });
   keyboard.push(navRow);
-  keyboard.push([{ text: "Ultimas 5", callback_data: "wiz:latest" }]);
   keyboard.push([{ text: "Volver al menu", callback_data: "wiz:main" }]);
 
   const selectedLabel = user.includeKeywords.length ? user.includeKeywords.slice(0, 6).join(", ") : "(ninguna)";
@@ -1396,6 +1882,26 @@ function formatThreadListLine(t: ThreadItem): string {
   return truncate(head.join(" "), 140);
 }
 
+function formatCoDateTimeFromSec(sec: number): string {
+  if (!sec || !Number.isFinite(sec) || sec <= 0) return "";
+  const ms = sec * 1000;
+
+  // Colombia is UTC-5, no DST.
+  const local = new Date(ms - 5 * 60 * 60 * 1000);
+
+  const yyyy = local.getUTCFullYear();
+  const mm = String(local.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(local.getUTCDate()).padStart(2, "0");
+
+  const h24 = local.getUTCHours();
+  const min = String(local.getUTCMinutes()).padStart(2, "0");
+  const ampm = h24 >= 12 ? "pm" : "am";
+  let h = h24 % 12;
+  if (h === 0) h = 12;
+
+  return `${dd}/${mm}/${yyyy} ${h}:${min}${ampm} COL`;
+}
+
 function formatLatestItemText(t: ThreadItem, idx: number, total: number): string {
   const lines: string[] = [];
   lines.push(`Pilas pues (${idx}/${total})`);
@@ -1405,8 +1911,7 @@ function formatLatestItemText(t: ThreadItem, idx: number, total: number): string
   head.push(t.title);
   lines.push(truncate(head.join(" "), 220));
   if (t.updatedAt && t.updatedAt > 0) {
-    const iso = new Date(t.updatedAt * 1000).toISOString().replace(".000Z", "Z");
-    lines.push(`Actualizado: ${iso}`);
+    lines.push(`Fecha: ${formatCoDateTimeFromSec(t.updatedAt)}`);
   }
   return lines.join("\n");
 }
@@ -1467,7 +1972,6 @@ async function sendForumsPage(
   if (p < totalPages - 1) navRow.push({ text: "Siguiente", callback_data: `forums_page:${p + 1}` });
   keyboard.push(navRow);
   keyboard.push([{ text: "Actualizar lista", callback_data: "refresh_forums" }]);
-  keyboard.push([{ text: "Ultimas 5", callback_data: "wiz:latest" }]);
   keyboard.push([{ text: "Volver al menu", callback_data: "wiz:main" }]);
 
   const text = ["Foros", "", "Toque el foro para prenderlo o quitarlo.", `Suscritos: ${user.forums.length}`].join("\n");
@@ -1505,7 +2009,6 @@ function startText(): string {
     "/foros",
     "/addkw <palabra>",
     "/list",
-    "/latest",
     "/leer <url>"
   ].join("\n");
 }
@@ -1523,7 +2026,6 @@ function helpText(): string {
     "/notify reviews on|off",
     "/notify donations on|off",
     "/list",
-    "/latest",
     "/leer <url>",
     "/cancel  (cancelar resena)"
   ].join("\n");
@@ -1561,6 +2063,14 @@ function nowSec(): number {
   return Math.floor(Date.now() / 1000);
 }
 
+function bumpFeedAfterFilterChange(u: UserConfig): UserConfig {
+  const now = nowSec();
+  if (!hasPositiveFilters(u)) {
+    return { ...u, feedNextAt: 0, feedDelivered: [], feedRecentThreadIds: [] };
+  }
+  return { ...u, feedNextAt: scheduleFeedSoonAt(now), feedDelivered: [], feedRecentThreadIds: [] };
+}
+
 async function ensureUser(env: Env, chatId: number): Promise<UserConfig> {
   const existing = await getUser(env, chatId);
   if (existing) return existing;
@@ -1591,7 +2101,10 @@ function createDefaultUser(chatId: number): UserConfig {
     notifyThreads: true,
     notifyReplies: true,
     notifyReviews: true,
-    notifyDonations: true
+    notifyDonations: true,
+    feedNextAt: 0,
+    feedDelivered: [],
+    feedRecentThreadIds: []
   };
 }
 
@@ -1605,6 +2118,11 @@ async function getUser(env: Env, chatId: number): Promise<UserConfig | null> {
   const excludeKeywords: string[] = Array.isArray(raw.excludeKeywords) ? raw.excludeKeywords : [];
   const prefixes: string[] = Array.isArray(raw.prefixes) ? raw.prefixes : [];
 
+  const feedDelivered: string[] = Array.isArray(raw.feedDelivered) ? raw.feedDelivered.map((x: any) => String(x)) : [];
+  const feedRecentThreadIds: number[] = Array.isArray(raw.feedRecentThreadIds)
+    ? raw.feedRecentThreadIds.map((x: any) => Number(x)).filter((n: number) => Number.isFinite(n))
+    : [];
+
   const u: UserConfig = {
     v: 1,
     chatId: typeof raw.chatId === "number" ? raw.chatId : chatId,
@@ -1617,7 +2135,10 @@ async function getUser(env: Env, chatId: number): Promise<UserConfig | null> {
     notifyThreads: typeof raw.notifyThreads === "boolean" ? raw.notifyThreads : true,
     notifyReplies: typeof raw.notifyReplies === "boolean" ? raw.notifyReplies : true,
     notifyReviews: typeof raw.notifyReviews === "boolean" ? raw.notifyReviews : true,
-    notifyDonations: typeof raw.notifyDonations === "boolean" ? raw.notifyDonations : true
+    notifyDonations: typeof raw.notifyDonations === "boolean" ? raw.notifyDonations : true,
+    feedNextAt: typeof raw.feedNextAt === "number" ? raw.feedNextAt : 0,
+    feedDelivered: feedDelivered.slice(-FEED_DELIVERED_MAX),
+    feedRecentThreadIds: feedRecentThreadIds.slice(-FEED_RECENT_THREAD_MAX)
   };
   return u;
 }
@@ -2085,6 +2606,26 @@ async function fetchText(url: string): Promise<string | null> {
   }
 }
 
+async function fetchTextWithTimeout(url: string, timeoutMs: number): Promise<string | null> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), Math.max(1, timeoutMs));
+  try {
+    const res = await fetch(url, {
+      headers: {
+        "User-Agent": "radar-x-bot/1.0",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+      },
+      signal: controller.signal
+    });
+    if (!res.ok) return null;
+    return await res.text();
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function telegramApi(env: Env, method: string, payload: any): Promise<any> {
   try {
     const url = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/${method}`;
@@ -2114,6 +2655,16 @@ async function tgSendMessage(
     disable_web_page_preview: disablePreview,
     reply_markup: replyMarkup
   });
+}
+
+async function tgSendPhoto(env: Env, chatId: number, photoUrl: string, caption: string, replyMarkup?: any): Promise<boolean> {
+  const res = await telegramApi(env, "sendPhoto", {
+    chat_id: chatId,
+    photo: photoUrl,
+    caption: caption || undefined,
+    reply_markup: replyMarkup
+  });
+  return Boolean(res);
 }
 
 async function tgSendLongMessage(env: Env, chatId: number, text: string, disablePreview: boolean): Promise<void> {
@@ -2371,8 +2922,7 @@ function formatLatestReviewItemText(it: ReviewIndexEntry, idx: number, total: nu
   lines.push(`Pilas pues resenas (${idx}/${total})`);
   lines.push(`[${it.city}] ${truncate(it.title || it.id, 180)}`);
   if (it.createdAt) {
-    const iso = new Date(it.createdAt * 1000).toISOString().replace(".000Z", "Z");
-    lines.push(`Fecha: ${iso}`);
+    lines.push(`Fecha: ${formatCoDateTimeFromSec(it.createdAt)}`);
   }
   return lines.join("\n");
 }
@@ -2388,8 +2938,7 @@ async function sendReviewRead(env: Env, chatId: number, id: string): Promise<voi
   const lines: string[] = [];
   lines.push(item.title);
   lines.push(`Ciudad: ${item.city}`);
-  const iso = new Date(item.createdAt * 1000).toISOString().replace(".000Z", "Z");
-  lines.push(`Fecha: ${iso}`);
+  lines.push(`Fecha: ${formatCoDateTimeFromSec(item.createdAt)}`);
   lines.push("");
   lines.push(item.story || item.raw || "(sin texto)");
   if (base) {
@@ -2583,7 +3132,7 @@ async function handleReviewPage(request: Request, env: Env): Promise<Response> {
   const title = escapeHtml(item.title || "Resena");
   const city = escapeHtml(item.city || "");
   const story = escapeHtml(item.story || item.raw || "");
-  const created = new Date((item.createdAt || 0) * 1000).toISOString().replace(".000Z", "Z");
+  const created = formatCoDateTimeFromSec(item.createdAt || 0);
 
   const html = `<!doctype html>
 <html lang="es">
