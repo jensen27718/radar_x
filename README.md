@@ -14,9 +14,10 @@ Si el token ya fue compartido en publico, revocalo y genera uno nuevo con BotFat
   - Suscripcion a foros (por URL o desde `/foros`)
   - Palabras clave (incluir / excluir)
   - Prefijos/labels (ej: "Resena", "Pregunta", etc, si el sitio los expone en HTML)
-- Notificaciones automaticas:
-  - Nuevo tema (thread)
-  - Nueva respuesta (reply) en foros suscritos (best-effort, basado en timestamps del HTML)
+- Notificaciones automaticas (feed):
+  - Envios en tiempos aleatorios por usuario (entre 5 y 60 min)
+  - Si no hay nada nuevo para tu filtro, manda contenido mas viejo (para que siempre haya algo)
+  - Detecta: nuevo tema (thread) y nueva respuesta (reply) en foros/home (best-effort)
 - Resenas (dentro del bot):
   - Crear resena por ciudad (wizard)
   - Ver ultimas resenas filtradas por tus ciudades/temas
@@ -24,13 +25,13 @@ Si el token ya fue compartido en publico, revocalo y genera uno nuevo con BotFat
 - Donaciones (Wompi):
   - Landing `/donar` estilo "vaquita" con meta mensual y botones de $1k/$2k/$5k/$10k
   - Webhook `/wompi/webhook` para sumar aportes aprobados (APPROVED)
-- Comandos para navegar:
-  - `/latest` muestra los ultimos resultados con tus filtros
+- Lectura:
+  - Boton "Leer" abre una pagina `/leer?u=...` (lector simple con imagen si existe)
   - `/leer <url>` devuelve titulo + extracto del contenido (tambien funciona si pegas un link directo)
 
 ## Comandos del bot
 
-- Recomendado: usa `/start` y sigue el wizard por botones (ciudades, foros, ultimas 5).
+- Recomendado: usa `/start` y sigue el wizard por botones (ciudades y/o foros). Con eso ya queda prendido el feed.
 - `/start`
 - `/help`
 - `/foros` (lista con botones para suscribirte / quitar)
@@ -44,7 +45,6 @@ Si el token ya fue compartido en publico, revocalo y genera uno nuevo con BotFat
 - `/notify reviews on|off`
 - `/notify donations on|off`
 - `/list` (o `/filtros`)
-- `/latest` (o `/ultimos`)
 - `/leer <url>` (o `/read <url>`)
 - `/cancel` (cancelar una resena en curso)
 
@@ -113,7 +113,7 @@ Invoke-RestMethod -Method Post `
 
 - Si es la primera vez que usas Workers en esa cuenta, registra tu subdominio `workers.dev` en el dashboard de Cloudflare (Workers & Pages) antes del primer deploy.
 - El cron esta configurado en `wrangler.toml` cada 5 minutos (`*/5 * * * *`).
-- La primera ejecucion "primea" estado y no manda spam historico. Para ver contenido inmediato usa `/latest`.
+- La primera ejecucion "primea" estado y no manda spam historico.
 
 ## Config Wompi (resumen)
 
