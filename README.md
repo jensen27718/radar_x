@@ -13,14 +13,13 @@ Si el token ya fue compartido en publico, revocalo y genera uno nuevo con BotFat
 ## Funciones
 
 - Resenas (principal):
-  - Wizard para crear resenas (modo rapido o completo tipo DonColombia)
+  - Wizard para crear resenas (simple, con estrellitas y plantilla tipo DonColombia)
   - Buscar resena por nombre/apodo, telefono, link o ID
-  - Interaccion: votos "Buena/Mala" + opiniones (comentarios)
+  - Interaccion: votos "Buena (5⭐) / Mala (1⭐)" + opiniones (comentarios)
   - Pagina publica por resena: `/r/<id>` (para abrir desde Telegram)
-  - IA opcional (DeepSeek) para mejorar el relato del "Comentario general" (sin inventar datos)
 - Filtros por usuario:
   - Suscripcion a foros (por URL o desde `/foros`)
-  - Palabras clave (incluir / excluir)
+  - Ciudades de Colombia (lista completa por departamento/municipio) + palabras clave (incluir / excluir)
   - Prefijos/labels (ej: "Resena", "Pregunta", etc, si el sitio los expone en HTML)
 - Notificaciones automaticas (feed):
   - Envios en tiempos aleatorios por usuario (entre 5 y 60 min)
@@ -89,9 +88,6 @@ npx.cmd wrangler secret put TELEGRAM_WEBHOOK_SECRET_TOKEN
 # Wompi (donaciones)
 npx.cmd wrangler secret put WOMPI_INTEGRITY_SECRET
 npx.cmd wrangler secret put WOMPI_EVENTS_SECRET
-
-# DeepSeek (opcional, para mejorar el relato de resenas)
-npx.cmd wrangler secret put DEEPSEEK_API_KEY
 ```
 
 5. Deploy:

@@ -1,4 +1,4 @@
-export interface Env {
+﻿export interface Env {
   TELEGRAM_BOT_TOKEN: string;
   TELEGRAM_WEBHOOK_SECRET_TOKEN: string;
   KV: KVNamespace;
@@ -14,11 +14,6 @@ export interface Env {
   WOMPI_EVENTS_SECRET?: string;
   DONATION_MONTHLY_GOAL_CENTS?: string;
   DONATION_REFERENCE_PREFIX?: string;
-
-  // DeepSeek (optional, used to improve review narratives)
-  DEEPSEEK_API_KEY?: string;
-  DEEPSEEK_BASE_URL?: string;
-  DEEPSEEK_MODEL?: string;
 }
 
 type ForumRef = {
@@ -98,6 +93,7 @@ type ReviewItem = {
   id: string;
   createdAt: number;
   createdBy: number;
+  department?: string;
   city: string;
   title: string;
   tags: string[];
@@ -146,58 +142,29 @@ type ReviewDraft = {
   createdAt: number;
   updatedAt: number;
   step:
-    | "await_mode"
     | "await_name"
-    | "await_age"
-    | "pick_skin"
-    | "await_height"
-    | "pick_face"
-    | "pick_breasts"
-    | "pick_butt"
     | "pick_photos"
     | "pick_physical_score"
-    | "pick_hygiene"
-    | "pick_kisses"
-    | "pick_oral_condition"
-    | "pick_oral_quality"
-    | "pick_anal_offer"
-    | "pick_anal_quality"
     | "pick_service_score"
     | "pick_service_time"
     | "await_rate"
     | "pick_place"
-    | "pick_pay_on_entry"
-    | "pick_site_quality"
     | "await_comment"
     | "await_phone"
     | "await_contact_link"
     | "confirm";
+  department?: string;
   city: string;
-  mode?: "quick" | "full";
 
   subjectName?: string;
-  age?: number;
-  skinColor?: string;
-  height?: string;
-  face?: string;
-  breasts?: string;
-  butt?: string;
   photosMatch?: string;
   physicalScore?: number;
 
-  hygiene?: string;
-  kisses?: string;
-  oralCondition?: string;
-  oralQuality?: string;
-  analOffer?: string;
-  analQuality?: string;
   serviceScore?: number;
 
   serviceTime?: string;
   rateCop?: number;
   place?: string;
-  payOnEntry?: string;
-  siteQuality?: string;
   comment?: string;
   phone?: string;
   contactLink?: string;
@@ -225,6 +192,18 @@ type SearchDraft = {
   step: "await_query";
 };
 
+type CoPlacesDepartment = {
+  id: string;
+  name: string;
+  cities: string[];
+};
+
+type CoPlacesCache = {
+  v: 1;
+  updatedAt: number;
+  departments: CoPlacesDepartment[];
+};
+
 type DonationMonth = {
   v: 1;
   month: string; // YYYY-MM
@@ -249,6 +228,10 @@ const REVIEW_COMMENTS_INDEX_KEY_PREFIX = "reviewcomments:index:";
 
 const DONATIONS_MONTH_KEY_PREFIX = "donations:month:";
 const DONATIONS_TX_KEY_PREFIX = "donations:tx:";
+
+const CO_PLACES_CACHE_KEY = "places:co:v2";
+const CO_PLACES_SOURCE_URL =
+  "https://gist.githubusercontent.com/john-guerra/b5848316671422b19e19bfca7f8aadcb/raw/275dca38ffbb1479afc7c0df1ed660ecfd3038b7/Departamentos_y_municipios_de_Colombia.csv";
 
 const DEFAULT_POLL_THREAD_LIMIT = 35;
 const DEFAULT_HOME_THREAD_LIMIT = 20;
@@ -1002,18 +985,20 @@ async function sendFeedReviewAlert(
   it: ReviewIndexEntry,
   opts: { isRepeat: boolean }
 ): Promise<void> {
-  const label = opts.isRepeat ? "Pa que no se le pase" : "Resena";
+  const label = opts.isRepeat ? "Pa que no se le pase" : "Resena nueva";
   const title = truncate(it.title || it.subjectName || it.id, 220);
 
   const lines: string[] = [];
-  lines.push(`Pilas pues: ${label}`);
-  lines.push(`[${it.city}] ${title}`);
+  lines.push(`🔥 Pilas pues: ${label}`);
+  lines.push(`🏙️ [${it.city}] ${title}`);
   if (it.createdAt) lines.push(`Fecha: ${formatCoDateTimeFromSec(it.createdAt)}`);
 
   const up = typeof it.votesUp === "number" ? it.votesUp : 0;
   const down = typeof it.votesDown === "number" ? it.votesDown : 0;
   const cc = typeof it.commentsCount === "number" ? it.commentsCount : 0;
-  if (up || down || cc) lines.push(`Votos: +${up} / -${down} | Opiniones: ${cc}`);
+  const stars = votesToStars(up, down);
+  if (stars.count > 0) lines.push(`⭐ Calificacion: ${stars.stars} ${stars.avg.toFixed(1)}/5 (${stars.count} votos)`);
+  if (cc > 0) lines.push(`💬 Opiniones: ${cc}`);
 
   await tgSendMessage(env, chatId, lines.join("\n"), true, buildReviewInlineKeyboard(env, it.id));
 }
@@ -1354,29 +1339,85 @@ async function handleTelegramCallback(cb: any, env: Env): Promise<void> {
     return;
   }
 
+  if (data.startsWith("dept_pick:")) {
+    const parts = data.split(":");
+    const deptId = parts[1] ?? "";
+    const deptPage = parseInt(parts[2] ?? "0", 10);
+    if (!deptId) {
+      await tgAnswerCallback(env, cb.id, "");
+      return;
+    }
+    if (messageId) await sendDepartmentCitiesPage(env, user, chatId, deptId, 0, Number.isFinite(deptPage) ? deptPage : 0, true, messageId);
+    await tgAnswerCallback(env, cb.id, "De una");
+    return;
+  }
+
+  if (data.startsWith("dept_cities:")) {
+    const parts = data.split(":");
+    const deptId = parts[1] ?? "";
+    const cityPage = parseInt(parts[2] ?? "0", 10);
+    const deptPage = parseInt(parts[3] ?? "0", 10);
+    if (!deptId) {
+      await tgAnswerCallback(env, cb.id, "");
+      return;
+    }
+    if (messageId)
+      await sendDepartmentCitiesPage(
+        env,
+        user,
+        chatId,
+        deptId,
+        Number.isFinite(cityPage) ? cityPage : 0,
+        Number.isFinite(deptPage) ? deptPage : 0,
+        true,
+        messageId
+      );
+    await tgAnswerCallback(env, cb.id, "");
+    return;
+  }
+
   if (data.startsWith("city_toggle:")) {
     const parts = data.split(":");
-    const cityId = parts[1] ?? "";
-    const page = parseInt(parts[2] ?? "0", 10);
-    const city = CITY_PRESETS.find((c) => c.id === cityId);
-    if (!city) {
+    const deptId = parts[1] ?? "";
+    const cityIdx = parseInt(parts[2] ?? "", 10);
+    const cityPage = parseInt(parts[3] ?? "0", 10);
+    const deptPage = parseInt(parts[4] ?? "0", 10);
+    if (!deptId || !Number.isFinite(cityIdx)) {
       await tgAnswerCallback(env, cb.id, "");
       return;
     }
 
-    const isOn = user.includeKeywords.some((k) => normalize(k) === normalize(city.name));
-    let next = isOn ? removeValue(user, "includeKeywords", city.name) : addUnique(user, "includeKeywords", city.name);
+    const places = await getCoPlaces(env);
+    const dept = places.departments.find((d) => d.id === deptId) ?? null;
+    const name = dept && cityIdx >= 0 && cityIdx < dept.cities.length ? dept.cities[cityIdx] : "";
+    if (!dept || !name) {
+      await tgAnswerCallback(env, cb.id, "");
+      return;
+    }
+
+    const isOn = user.includeKeywords.some((k) => normalize(k) === normalize(name));
+    let next = isOn ? removeValue(user, "includeKeywords", name) : addUnique(user, "includeKeywords", name);
 
     // Best-effort: if there is exactly one forum whose name contains the city, auto-subscribe.
     if (!isOn) {
       const cache = await getForumCache(env);
-      const hits = cache.forums.filter((f) => normalize(f.name).includes(normalize(city.name)));
+      const hits = cache.forums.filter((f) => normalize(f.name).includes(normalize(name)));
       if (hits.length === 1) next = addForum(next, hits[0]);
     }
 
     next = bumpFeedAfterFilterChange(next);
     await putUser(env, next);
-    if (messageId) await sendCitiesPage(env, next, chatId, Number.isFinite(page) ? page : 0, true, messageId);
+    if (messageId)
+      await sendDepartmentCitiesPage(
+        env,
+        next,
+        chatId,
+        deptId,
+        Number.isFinite(cityPage) ? cityPage : 0,
+        Number.isFinite(deptPage) ? deptPage : 0,
+        true,
+        messageId
+      );
     await tgAnswerCallback(env, cb.id, "De una");
     return;
   }
@@ -1384,13 +1425,6 @@ async function handleTelegramCallback(cb: any, env: Env): Promise<void> {
   if (data.startsWith("rvw:")) {
     const parts = data.split(":");
     const action = parts[1] ?? "";
-
-    if (action === "citypage") {
-      const page = parseInt(parts[2] ?? "0", 10);
-      if (messageId) await sendReviewCityPage(env, chatId, Number.isFinite(page) ? page : 0, true, messageId);
-      await tgAnswerCallback(env, cb.id, "");
-      return;
-    }
 
     if (action === "latest") {
       await tgAnswerCallback(env, cb.id, "Ya casi...");
@@ -1412,17 +1446,99 @@ async function handleTelegramCallback(cb: any, env: Env): Promise<void> {
     }
 
     if (action === "new") {
-      if (messageId) await sendReviewCityPage(env, chatId, 0, true, messageId);
-      else await sendReviewCityPage(env, chatId, 0, false);
+      if (messageId) await sendReviewStartCityChooser(env, user, chatId, true, messageId);
+      else await sendReviewStartCityChooser(env, user, chatId, false);
       await tgAnswerCallback(env, cb.id, "");
       return;
     }
 
-    if (action === "city") {
-      const cityId = parts[2] ?? "";
-      const page = parseInt(parts[3] ?? "0", 10);
-      const city = CITY_PRESETS.find((c) => c.id === cityId);
-      if (!city) {
+    if (action === "deps") {
+      const page = parseInt(parts[2] ?? "0", 10);
+      if (messageId) await sendReviewDepartmentsPage(env, chatId, Number.isFinite(page) ? page : 0, true, messageId);
+      await tgAnswerCallback(env, cb.id, "");
+      return;
+    }
+
+    if (action === "dep") {
+      const deptId = parts[2] ?? "";
+      const deptPage = parseInt(parts[3] ?? "0", 10);
+      if (!deptId) {
+        await tgAnswerCallback(env, cb.id, "");
+        return;
+      }
+      if (messageId)
+        await sendReviewDeptCitiesPage(env, chatId, deptId, 0, Number.isFinite(deptPage) ? deptPage : 0, true, messageId);
+      await tgAnswerCallback(env, cb.id, "");
+      return;
+    }
+
+    if (action === "depcities") {
+      const deptId = parts[2] ?? "";
+      const cityPage = parseInt(parts[3] ?? "0", 10);
+      const deptPage = parseInt(parts[4] ?? "0", 10);
+      if (!deptId) {
+        await tgAnswerCallback(env, cb.id, "");
+        return;
+      }
+      if (messageId)
+        await sendReviewDeptCitiesPage(
+          env,
+          chatId,
+          deptId,
+          Number.isFinite(cityPage) ? cityPage : 0,
+          Number.isFinite(deptPage) ? deptPage : 0,
+          true,
+          messageId
+        );
+      await tgAnswerCallback(env, cb.id, "");
+      return;
+    }
+
+    if (action === "pickcity") {
+      const token = parts[2] ?? "";
+      const idx = parseInt(parts[3] ?? "", 10);
+      if (!token || !Number.isFinite(idx)) {
+        await tgAnswerCallback(env, cb.id, "");
+        return;
+      }
+      const pickKey = `pick:rvwcity:${chatId}:${token}`;
+      const pick = (await env.KV.get(pickKey, { type: "json" }).catch(() => null)) as any;
+      const cities: unknown = pick?.cities;
+      if (!pick || pick.chatId !== chatId || !Array.isArray(cities) || idx < 0 || idx >= cities.length) {
+        await tgAnswerCallback(env, cb.id, "Se vencio");
+        return;
+      }
+      const cityName = String(cities[idx] ?? "").trim();
+      if (!cityName) {
+        await tgAnswerCallback(env, cb.id, "");
+        return;
+      }
+      const draft: ReviewDraft = {
+        v: 1,
+        chatId,
+        createdAt: nowSec(),
+        updatedAt: nowSec(),
+        step: "await_name",
+        city: cityName,
+        tags: [cityName]
+      };
+      await putReviewDraft(env, draft);
+      await tgAnswerCallback(env, cb.id, "Listo");
+      await sendReviewDraftPrompt(env, chatId, draft);
+      return;
+    }
+
+    if (action === "pick") {
+      const deptId = parts[2] ?? "";
+      const cityIdx = parseInt(parts[3] ?? "", 10);
+      if (!deptId || !Number.isFinite(cityIdx)) {
+        await tgAnswerCallback(env, cb.id, "");
+        return;
+      }
+      const places = await getCoPlaces(env);
+      const dept = places.departments.find((d) => d.id === deptId) ?? null;
+      const cityName = dept && cityIdx >= 0 && cityIdx < dept.cities.length ? dept.cities[cityIdx] : "";
+      if (!dept || !cityName) {
         await tgAnswerCallback(env, cb.id, "");
         return;
       }
@@ -1432,34 +1548,14 @@ async function handleTelegramCallback(cb: any, env: Env): Promise<void> {
         chatId,
         createdAt: nowSec(),
         updatedAt: nowSec(),
-        step: "await_mode",
-        city: city.name,
-        tags: [city.name]
+        step: "await_name",
+        department: dept.name,
+        city: cityName,
+        tags: [dept.name, cityName]
       };
       await putReviewDraft(env, draft);
-
       await tgAnswerCallback(env, cb.id, "Listo");
       await sendReviewDraftPrompt(env, chatId, draft);
-
-      if (messageId) await sendReviewCityPage(env, chatId, Number.isFinite(page) ? page : 0, true, messageId);
-      return;
-    }
-
-    if (action === "mode") {
-      const mode = parts[2] ?? "";
-      if (mode !== "quick" && mode !== "full") {
-        await tgAnswerCallback(env, cb.id, "");
-        return;
-      }
-      const draft = await getReviewDraft(env, chatId);
-      if (!draft) {
-        await tgAnswerCallback(env, cb.id, "Se vencio");
-        return;
-      }
-      const next: ReviewDraft = { ...draft, mode: mode as any, step: "await_name", updatedAt: nowSec() };
-      await putReviewDraft(env, next);
-      await tgAnswerCallback(env, cb.id, "Dale");
-      await sendReviewDraftPrompt(env, chatId, next);
       return;
     }
 
@@ -1518,8 +1614,8 @@ async function handleTelegramCallback(cb: any, env: Env): Promise<void> {
     if (action === "restart") {
       await deleteReviewDraft(env, chatId);
       await tgAnswerCallback(env, cb.id, "Listo");
-      if (messageId) await sendReviewCityPage(env, chatId, 0, true, messageId);
-      else await sendReviewCityPage(env, chatId, 0, false);
+      if (messageId) await sendReviewStartCityChooser(env, user, chatId, true, messageId);
+      else await sendReviewStartCityChooser(env, user, chatId, false);
       return;
     }
 
@@ -1542,7 +1638,12 @@ async function handleTelegramCallback(cb: any, env: Env): Promise<void> {
         return;
       }
       const out = await applyReviewVote(env, id, chatId, dir as any);
-      const label = out ? `Listo. Votos: +${out.votesUp} / -${out.votesDown}` : "Uy, no pude votar en esa resena.";
+      const label = out
+        ? (() => {
+            const s = votesToStars(out.votesUp, out.votesDown);
+            return `Listo. ${s.stars} ${s.avg.toFixed(1)}/5 (${s.count} votos)`;
+          })()
+        : "Uy, no pude votar en esa resena.";
       await tgAnswerCallback(env, cb.id, label);
       return;
     }
@@ -2012,9 +2113,9 @@ async function sendHelpPage(env: Env, user: UserConfig, chatId: number, edit: bo
   const text = [
     "Ayuda (facil, sin enredos)",
     "",
-    "1) Toque 'Elegir ciudad' y escoja su ciudad (o varias).",
+    "1) Toque 'Elegir ciudad', elija el departamento y marque municipios.",
     "2) Toque 'Buscar resena' o 'Crear resena' y siga los botones.",
-    "3) La gente puede votar (buena/mala) y opinar en cada resena.",
+    "3) La gente puede votar (Buena 5⭐ / Mala 1⭐) y opinar en cada resena.",
     "4) Con filtros prendidos, le van llegando resenas cada ratico (entre 5 y 60 min).",
     "5) Si no hay resenas nuevas, le mando resenas viejas o contenido de DonColombia (secundario).",
     "6) Si quiere apoyar el proyecto: toque 'Donar'.",
@@ -2091,17 +2192,16 @@ async function sendCitiesPage(
   edit: boolean,
   messageId?: number
 ): Promise<void> {
-  const totalPages = Math.max(1, Math.ceil(CITY_PRESETS.length / CITY_PAGE_SIZE));
+  const places = await getCoPlaces(env);
+  const deps = places.departments;
+  const totalPages = Math.max(1, Math.ceil(deps.length / CITY_PAGE_SIZE));
   const p = Math.min(Math.max(0, page), totalPages - 1);
   const start = p * CITY_PAGE_SIZE;
-  const slice = CITY_PRESETS.slice(start, start + CITY_PAGE_SIZE);
-
-  const selected = new Set(user.includeKeywords.map((k) => normalize(k)));
+  const slice = deps.slice(start, start + CITY_PAGE_SIZE);
 
   const keyboard: any[][] = [];
-  for (const c of slice) {
-    const on = selected.has(normalize(c.name));
-    keyboard.push([{ text: `${on ? "[x]" : "[ ]"} ${c.name}`, callback_data: `city_toggle:${c.id}:${p}` }]);
+  for (const d of slice) {
+    keyboard.push([{ text: d.name, callback_data: `dept_pick:${d.id}:${p}` }]);
   }
 
   const navRow: any[] = [];
@@ -2113,12 +2213,61 @@ async function sendCitiesPage(
 
   const selectedLabel = user.includeKeywords.length ? user.includeKeywords.slice(0, 6).join(", ") : "(ninguna)";
   const text = [
-    "Ciudades",
+    "Ciudades (Colombia)",
     "",
-    "Escoja una o varias. Cuando salga algo de esa ciudad, le aviso.",
+    "Primero escoja el departamento y ahi le salen los municipios.",
     "",
     `Seleccionadas: ${selectedLabel}`
   ].join("\n");
+
+  const replyMarkup = { inline_keyboard: keyboard };
+  if (edit && messageId) await tgEditMessage(env, chatId, messageId, text, replyMarkup);
+  else await tgSendMessage(env, chatId, text, true, replyMarkup);
+}
+
+async function sendDepartmentCitiesPage(
+  env: Env,
+  user: UserConfig,
+  chatId: number,
+  deptId: string,
+  cityPage: number,
+  deptPage: number,
+  edit: boolean,
+  messageId?: number
+): Promise<void> {
+  const places = await getCoPlaces(env);
+  const dept = places.departments.find((d) => d.id === deptId) ?? null;
+  if (!dept) {
+    await tgSendMessage(env, chatId, "Uy, no encontre ese departamento. Vuelva a intentar.", true, {
+      inline_keyboard: [[{ text: "Volver", callback_data: `wiz:cities:${deptPage}` }]]
+    });
+    return;
+  }
+
+  const totalPages = Math.max(1, Math.ceil(dept.cities.length / CITY_PAGE_SIZE));
+  const p = Math.min(Math.max(0, cityPage), totalPages - 1);
+  const start = p * CITY_PAGE_SIZE;
+  const slice = dept.cities.slice(start, start + CITY_PAGE_SIZE);
+
+  const selected = new Set(user.includeKeywords.map((k) => normalize(k)));
+  const keyboard: any[][] = [];
+  for (let i = 0; i < slice.length; i++) {
+    const name = slice[i];
+    const on = selected.has(normalize(name));
+    const cityIdx = start + i;
+    keyboard.push([{ text: `${on ? "[x]" : "[ ]"} ${name}`, callback_data: `city_toggle:${dept.id}:${cityIdx}:${p}:${deptPage}` }]);
+  }
+
+  const navRow: any[] = [];
+  if (p > 0) navRow.push({ text: "Anterior", callback_data: `dept_cities:${dept.id}:${p - 1}:${deptPage}` });
+  navRow.push({ text: `${p + 1}/${totalPages}`, callback_data: `dept_cities:${dept.id}:${p}:${deptPage}` });
+  if (p < totalPages - 1) navRow.push({ text: "Siguiente", callback_data: `dept_cities:${dept.id}:${p + 1}:${deptPage}` });
+  keyboard.push(navRow);
+  keyboard.push([{ text: "Volver (departamentos)", callback_data: `wiz:cities:${deptPage}` }]);
+  keyboard.push([{ text: "Menu", callback_data: "wiz:main" }]);
+
+  const selectedLabel = user.includeKeywords.length ? user.includeKeywords.slice(0, 6).join(", ") : "(ninguna)";
+  const text = ["Departamento: " + dept.name, "", "Toque para marcar/quitar municipios.", "", `Seleccionadas: ${selectedLabel}`].join("\n");
 
   const replyMarkup = { inline_keyboard: keyboard };
   if (edit && messageId) await tgEditMessage(env, chatId, messageId, text, replyMarkup);
@@ -2530,6 +2679,110 @@ async function refreshForumCache(env: Env, force: boolean): Promise<{ fetchedAt:
   const forums = html ? parseForumsFromHtml(html, env.SITE_BASE_URL) : [];
   const payload = { fetchedAt: now, forums };
   await env.KV.put(FORUM_CACHE_KEY, JSON.stringify(payload));
+  return payload;
+}
+
+function coPlaceId(name: string): string {
+  const n = normalize(name);
+  return n.replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+}
+
+function parseCoPlacesCsv(textRaw: string): CoPlacesDepartment[] {
+  let text = String(textRaw ?? "");
+  // Remove BOM and bidi marks (seen in some CSV exports).
+  text = text.replace(/^\uFEFF/, "").replace(/[\u202A-\u202E\u200E\u200F]/g, "");
+  text = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+
+  // Some raw views can lose newlines; re-insert them before each "Region/Región" row marker.
+  const nlCount = (text.match(/\n/g) ?? []).length;
+  if (nlCount < 10) {
+    text = text.replace(/\s+Regi[oó]n\s+/g, "\nRegión ");
+    text = text.replace(/\s+Region\s+/g, "\nRegion ");
+  }
+
+  const lines = text
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean);
+
+  const deptMeta = new Map<string, { name: string; cities: Set<string> }>();
+
+  const parseLine = (line: string): { deptId: string; deptName: string; city: string } | null => {
+    const s = String(line ?? "").trim();
+    if (!s) return null;
+    const upper = stripDiacritics(s).toUpperCase();
+    if (upper.startsWith("REGION,")) return null;
+
+    // Robust parsing: split by comma, then use numeric codes as anchors.
+    const tokens = s.split(",").map((t) => t.trim()).filter(Boolean);
+    if (tokens.length < 5) return null;
+
+    let deptCodeIdx = -1;
+    for (let i = 1; i < Math.min(tokens.length, 6); i++) {
+      if (/^\d{1,2}$/.test(tokens[i])) {
+        deptCodeIdx = i;
+        break;
+      }
+    }
+    if (deptCodeIdx === -1) return null;
+
+    const deptId = String(tokens[deptCodeIdx] ?? "").trim().padStart(2, "0");
+
+    let munCodeIdx = -1;
+    for (let i = deptCodeIdx + 1; i < tokens.length - 1; i++) {
+      if (/^\d{4,5}$/.test(tokens[i])) {
+        munCodeIdx = i;
+        break;
+      }
+    }
+    if (munCodeIdx === -1) return null;
+
+    const deptName = tokens.slice(deptCodeIdx + 1, munCodeIdx).join(", ").trim();
+    const city = tokens.slice(munCodeIdx + 1).join(", ").trim();
+    if (!deptId || !deptName || !city) return null;
+    return { deptId, deptName, city };
+  };
+
+  for (const line of lines) {
+    const row = parseLine(line);
+    if (!row) continue;
+    const deptId = row.deptId;
+    const city = row.city;
+    const existing = deptMeta.get(deptId);
+    if (!existing) deptMeta.set(deptId, { name: row.deptName, cities: new Set<string>([city]) });
+    else existing.cities.add(city);
+  }
+
+  const departments: CoPlacesDepartment[] = [];
+  for (const [deptId, meta] of deptMeta.entries()) {
+    const cities = Array.from(meta.cities);
+    cities.sort((a, b) => normalize(a).localeCompare(normalize(b)));
+    departments.push({ id: deptId, name: meta.name, cities });
+  }
+  departments.sort((a, b) => normalize(a.name).localeCompare(normalize(b.name)));
+  return departments;
+}
+
+function fallbackCoPlaces(): CoPlacesCache {
+  const now = nowSec();
+  // Best-effort fallback: keep the small preset list as a single bucket.
+  const cities = CITY_PRESETS.map((c) => c.name).slice().sort((a, b) => normalize(a).localeCompare(normalize(b)));
+  return { v: 1, updatedAt: now, departments: [{ id: "colombia", name: "Colombia", cities }] };
+}
+
+async function getCoPlaces(env: Env): Promise<CoPlacesCache> {
+  const cached = (await env.KV.get(CO_PLACES_CACHE_KEY, { type: "json" }).catch(() => null)) as any;
+  if (cached && cached.v === 1 && Array.isArray(cached.departments) && cached.departments.length > 0) {
+    return cached as CoPlacesCache;
+  }
+
+  const csv = await fetchTextWithTimeout(CO_PLACES_SOURCE_URL, 8500);
+  if (!csv) return fallbackCoPlaces();
+  const departments = parseCoPlacesCsv(csv);
+  if (!departments || departments.length === 0) return fallbackCoPlaces();
+
+  const payload: CoPlacesCache = { v: 1, updatedAt: nowSec(), departments };
+  await env.KV.put(CO_PLACES_CACHE_KEY, JSON.stringify(payload));
   return payload;
 }
 
@@ -3042,6 +3295,7 @@ function escapeHtml(s: string): string {
 type ReviewIndexEntry = {
   id: string;
   createdAt: number;
+  department?: string;
   city: string;
   title: string;
   subjectName?: string;
@@ -3080,6 +3334,7 @@ async function getReviewIndex(env: Env): Promise<ReviewIndexEntry[]> {
       out.push({
         id,
         createdAt: typeof (it as any).createdAt === "number" ? (it as any).createdAt : 0,
+        department: String((it as any).department ?? "").trim() || undefined,
         city: String((it as any).city ?? "").trim(),
         title: String((it as any).title ?? "").trim(),
         subjectName: String((it as any).subjectName ?? "").trim() || undefined,
@@ -3114,6 +3369,7 @@ async function saveReview(env: Env, item: ReviewItem): Promise<void> {
   const entry: ReviewIndexEntry = {
     id: item.id,
     createdAt: item.createdAt,
+    department: item.department,
     city: item.city,
     title: item.title,
     subjectName: item.subjectName,
@@ -3321,33 +3577,104 @@ async function sendReviewsMenu(env: Env, user: UserConfig, chatId: number, edit:
   else await tgSendMessage(env, chatId, text, true, replyMarkup);
 }
 
-async function sendReviewCityPage(env: Env, chatId: number, page: number, edit: boolean, messageId?: number): Promise<void> {
-  const totalPages = Math.max(1, Math.ceil(CITY_PRESETS.length / CITY_PAGE_SIZE));
-  const p = Math.min(Math.max(0, page), totalPages - 1);
-  const start = p * CITY_PAGE_SIZE;
-  const slice = CITY_PRESETS.slice(start, start + CITY_PAGE_SIZE);
+async function sendReviewStartCityChooser(
+  env: Env,
+  user: UserConfig,
+  chatId: number,
+  edit: boolean,
+  messageId?: number
+): Promise<void> {
+  const cities = Array.from(new Set((user.includeKeywords ?? []).map((x) => String(x)).filter(Boolean))).slice(0, 8);
 
-  const keyboard: any[][] = [];
-  for (const c of slice) {
-    keyboard.push([{ text: c.name, callback_data: `rvw:city:${c.id}:${p}` }]);
+  // If the user already has cities picked, offer them as quick buttons.
+  if (cities.length > 0) {
+    const token = randomTokenHex(6);
+    const pickKey = `pick:rvwcity:${chatId}:${token}`;
+    await env.KV.put(pickKey, JSON.stringify({ chatId, cities }), { expirationTtl: PICKS_TTL_SEC });
+
+    const keyboard: any[][] = cities.map((c, i) => [{ text: c, callback_data: `rvw:pickcity:${token}:${i}` }]);
+    keyboard.push([{ text: "Otra ciudad (lista completa)", callback_data: "rvw:deps:0" }]);
+    keyboard.push([{ text: "Cancelar", callback_data: "rvw:cancel" }]);
+
+    const text = ["🔥 Crear resena", "", "En que ciudad fue?"].join("\n");
+    const replyMarkup = { inline_keyboard: keyboard };
+    if (edit && messageId) await tgEditMessage(env, chatId, messageId, text, replyMarkup);
+    else await tgSendMessage(env, chatId, text, true, replyMarkup);
+    return;
   }
 
+  // No cities set yet -> go to full department list.
+  await sendReviewDepartmentsPage(env, chatId, 0, edit, messageId);
+}
+
+async function sendReviewDepartmentsPage(env: Env, chatId: number, page: number, edit: boolean, messageId?: number): Promise<void> {
+  const places = await getCoPlaces(env);
+  const deps = places.departments;
+  const totalPages = Math.max(1, Math.ceil(deps.length / CITY_PAGE_SIZE));
+  const p = Math.min(Math.max(0, page), totalPages - 1);
+  const start = p * CITY_PAGE_SIZE;
+  const slice = deps.slice(start, start + CITY_PAGE_SIZE);
+
+  const keyboard: any[][] = [];
+  for (const d of slice) keyboard.push([{ text: d.name, callback_data: `rvw:dep:${d.id}:${p}` }]);
+
   const navRow: any[] = [];
-  if (p > 0) navRow.push({ text: "Anterior", callback_data: `rvw:citypage:${p - 1}` });
-  navRow.push({ text: `${p + 1}/${totalPages}`, callback_data: `rvw:citypage:${p}` });
-  if (p < totalPages - 1) navRow.push({ text: "Siguiente", callback_data: `rvw:citypage:${p + 1}` });
+  if (p > 0) navRow.push({ text: "Anterior", callback_data: `rvw:deps:${p - 1}` });
+  navRow.push({ text: `${p + 1}/${totalPages}`, callback_data: `rvw:deps:${p}` });
+  if (p < totalPages - 1) navRow.push({ text: "Siguiente", callback_data: `rvw:deps:${p + 1}` });
   keyboard.push(navRow);
   keyboard.push([{ text: "Cancelar", callback_data: "rvw:cancel" }]);
-  keyboard.push([{ text: "Volver", callback_data: "wiz:reviews" }]);
 
-  const text = ["Crear resena", "", "En que ciudad fue?"].join("\n");
+  const text = ["🔥 Crear resena", "", "Primero elija el departamento:"].join("\n");
   const replyMarkup = { inline_keyboard: keyboard };
-
   if (edit && messageId) await tgEditMessage(env, chatId, messageId, text, replyMarkup);
   else await tgSendMessage(env, chatId, text, true, replyMarkup);
 }
 
-function reviewFlowSteps(mode: "quick" | "full"): ReviewDraft["step"][] {
+async function sendReviewDeptCitiesPage(
+  env: Env,
+  chatId: number,
+  deptId: string,
+  cityPage: number,
+  deptPage: number,
+  edit: boolean,
+  messageId?: number
+): Promise<void> {
+  const places = await getCoPlaces(env);
+  const dept = places.departments.find((d) => d.id === deptId) ?? null;
+  if (!dept) {
+    await tgSendMessage(env, chatId, "Uy, no encontre ese departamento.", true, {
+      inline_keyboard: [[{ text: "Volver", callback_data: `rvw:deps:${deptPage}` }]]
+    });
+    return;
+  }
+
+  const totalPages = Math.max(1, Math.ceil(dept.cities.length / CITY_PAGE_SIZE));
+  const p = Math.min(Math.max(0, cityPage), totalPages - 1);
+  const start = p * CITY_PAGE_SIZE;
+  const slice = dept.cities.slice(start, start + CITY_PAGE_SIZE);
+
+  const keyboard: any[][] = [];
+  for (let i = 0; i < slice.length; i++) {
+    const cityIdx = start + i;
+    keyboard.push([{ text: slice[i], callback_data: `rvw:pick:${dept.id}:${cityIdx}` }]);
+  }
+
+  const navRow: any[] = [];
+  if (p > 0) navRow.push({ text: "Anterior", callback_data: `rvw:depcities:${dept.id}:${p - 1}:${deptPage}` });
+  navRow.push({ text: `${p + 1}/${totalPages}`, callback_data: `rvw:depcities:${dept.id}:${p}:${deptPage}` });
+  if (p < totalPages - 1) navRow.push({ text: "Siguiente", callback_data: `rvw:depcities:${dept.id}:${p + 1}:${deptPage}` });
+  keyboard.push(navRow);
+  keyboard.push([{ text: "Volver (departamentos)", callback_data: `rvw:deps:${deptPage}` }]);
+  keyboard.push([{ text: "Cancelar", callback_data: "rvw:cancel" }]);
+
+  const text = ["🔥 Crear resena", "", `Departamento: ${dept.name}`, "Elija el municipio:"].join("\n");
+  const replyMarkup = { inline_keyboard: keyboard };
+  if (edit && messageId) await tgEditMessage(env, chatId, messageId, text, replyMarkup);
+  else await tgSendMessage(env, chatId, text, true, replyMarkup);
+}
+
+function reviewFlowSteps(): ReviewDraft["step"][] {
   const quick: ReviewDraft["step"][] = [
     "await_name",
     "pick_photos",
@@ -3361,36 +3688,7 @@ function reviewFlowSteps(mode: "quick" | "full"): ReviewDraft["step"][] {
     "await_contact_link",
     "confirm"
   ];
-
-  const full: ReviewDraft["step"][] = [
-    "await_name",
-    "await_age",
-    "pick_skin",
-    "await_height",
-    "pick_face",
-    "pick_breasts",
-    "pick_butt",
-    "pick_photos",
-    "pick_physical_score",
-    "pick_hygiene",
-    "pick_kisses",
-    "pick_oral_condition",
-    "pick_oral_quality",
-    "pick_anal_offer",
-    "pick_anal_quality",
-    "pick_service_score",
-    "pick_service_time",
-    "await_rate",
-    "pick_place",
-    "pick_pay_on_entry",
-    "pick_site_quality",
-    "await_comment",
-    "await_phone",
-    "await_contact_link",
-    "confirm"
-  ];
-
-  return mode === "full" ? full : quick;
+  return quick;
 }
 
 function reviewTitleFromDraft(d: ReviewDraft): string {
@@ -3401,6 +3699,7 @@ function reviewTitleFromDraft(d: ReviewDraft): string {
 
 function buildReviewTagsFromDraft(d: ReviewDraft): string[] {
   const tags: string[] = [];
+  if (d.department) tags.push(d.department);
   if (d.city) tags.push(d.city);
   const name = String(d.subjectName ?? "").trim();
   if (name) tags.push(name);
@@ -3474,44 +3773,78 @@ function computeFinalScore(physicalScore?: number, serviceScore?: number): numbe
   return a || b || undefined;
 }
 
+function renderStars(avg: number, maxStars: number): string {
+  const a = Number(avg);
+  if (!Number.isFinite(a) || maxStars <= 0) return "";
+  const clamped = Math.max(0, Math.min(maxStars, a));
+  const full = Math.max(0, Math.min(maxStars, Math.round(clamped)));
+  return "⭐".repeat(full) + "☆".repeat(Math.max(0, maxStars - full));
+}
+
+function votesToStars(votesUp?: number, votesDown?: number): { avg: number; count: number; stars: string } {
+  const up = Math.max(0, Math.floor(Number(votesUp ?? 0)));
+  const down = Math.max(0, Math.floor(Number(votesDown ?? 0)));
+  const count = up + down;
+  if (count <= 0) return { avg: 0, count: 0, stars: "☆☆☆☆☆" };
+  // Keep it simple: "Buena" counts as 5⭐, "Mala" counts as 1⭐.
+  const avg = (up * 5 + down * 1) / count;
+  return { avg, count, stars: renderStars(avg, 5) };
+}
+
+function formatScore10(score: number): string {
+  const n = Number(score);
+  if (!Number.isFinite(n) || n <= 0) return "";
+  const clamped = Math.max(1, Math.min(10, n));
+  const stars = renderStars(clamped / 2, 5);
+  const label = Number.isInteger(clamped) ? String(clamped) : clamped.toFixed(1);
+  return `${stars} (${label}/10)`;
+}
+
+function formatCopAmount(n: number): string {
+  const v = Math.floor(Number(n));
+  if (!Number.isFinite(v) || v <= 0) return "";
+  const s = String(v).replace(/\B(?=(\d{3})+(?!\d))/g, ".");
+  return `$${s} COP`;
+}
+
 function formatReviewTemplateFromItem(item: ReviewItem): string {
   const lines: string[] = [];
 
-  const pushLine = (label: string, value: any) => {
+  const pushKV = (emoji: string, label: string, value: any) => {
     const v = String(value ?? "").trim();
     if (!v) return;
-    lines.push(`- ${label}: ${v}`);
+    lines.push(`${emoji} ${label}: ${v}`);
   };
 
-  lines.push("Atributos Fisicos y Generales");
-  pushLine("Nombre/Apodo", item.subjectName);
-  pushLine("Edad", item.age ? `Aprox ${item.age} anos` : "");
-  pushLine("Color de piel", item.skinColor);
-  pushLine("Estatura", item.height ? `${item.height}` : "");
-  pushLine("Cara", item.face);
-  pushLine("Senos", item.breasts);
-  pushLine("Cola", item.butt);
-  pushLine("Es como las fotos", item.photosMatch);
-  pushLine("Calificacion del fisico", typeof item.physicalScore === "number" ? String(item.physicalScore) : "");
+  lines.push("🔥 Atributos Fisicos y Generales");
+  pushKV("👤", "Nombre/Apodo", item.subjectName);
+  pushKV("🎂", "Edad", item.age ? `${item.age} anos aprox` : "");
+  pushKV("🌈", "Color de piel", item.skinColor);
+  pushKV("📏", "Estatura", item.height ? `${item.height} m` : "");
+  pushKV("🙂", "Cara", item.face);
+  pushKV("🍒", "Senos", item.breasts);
+  pushKV("🍑", "Cola", item.butt);
+  pushKV("📸", "Es como las fotos", item.photosMatch);
+  pushKV("⭐", "Fisico", typeof item.physicalScore === "number" ? formatScore10(item.physicalScore) : "");
 
   lines.push("");
-  lines.push("Atributos NO Fisicos");
-  pushLine("Aseo y bioseguridad", item.hygiene);
-  pushLine("Da besos", item.kisses);
-  pushLine("Condicion del oral", item.oralCondition);
-  pushLine("Calidad del oral", item.oralQuality);
-  pushLine("Ofrece anal", item.analOffer);
-  pushLine("Calidad del anal", item.analQuality);
-  pushLine("Calificacion del servicio", typeof item.serviceScore === "number" ? String(item.serviceScore) : "");
+  lines.push("😈 Atributos NO Fisicos");
+  pushKV("🧼", "Aseo y bioseguridad", item.hygiene);
+  pushKV("💋", "Da besos", item.kisses);
+  pushKV("👅", "Condicion del oral", item.oralCondition);
+  pushKV("👅", "Calidad del oral", item.oralQuality);
+  pushKV("🍑", "Ofrece anal", item.analOffer);
+  pushKV("🍑", "Calidad del anal", item.analQuality);
+  pushKV("⭐", "Servicio", typeof item.serviceScore === "number" ? formatScore10(item.serviceScore) : "");
 
   lines.push("");
-  lines.push("Otros Aspectos");
-  pushLine("Tiempo del servicio", item.serviceTime);
-  pushLine("Tarifa", typeof item.rateCop === "number" ? `${item.rateCop} COP` : "");
-  pushLine("En donde fue", item.place);
-  pushLine("Se paga al ingresar", item.payOnEntry);
-  pushLine("Calidad del sitio", item.siteQuality);
-  pushLine("Calificacion final", typeof item.finalScore === "number" ? String(item.finalScore) : "");
+  lines.push("📍 Otros Aspectos");
+  pushKV("⏱️", "Tiempo del servicio", item.serviceTime);
+  pushKV("💸", "Tarifa", typeof item.rateCop === "number" ? formatCopAmount(item.rateCop) : "");
+  pushKV("🏨", "En donde fue", item.place);
+  pushKV("🔐", "Se paga al ingresar", item.payOnEntry);
+  pushKV("🏠", "Calidad del sitio", item.siteQuality);
+  pushKV("🏁", "Calificacion final", typeof item.finalScore === "number" ? formatScore10(item.finalScore) : "");
 
   // For new reviews, `story` is an edited narrative. For older stored items, `story` may contain the full template,
   // so we detect and ignore that legacy format.
@@ -3529,7 +3862,7 @@ function formatReviewTemplateFromItem(item: ReviewItem): string {
 
   if (narrative) {
     lines.push("");
-    lines.push("Comentario general");
+    lines.push("🗣️ Comentario general");
     lines.push(narrative);
   }
 
@@ -3537,9 +3870,9 @@ function formatReviewTemplateFromItem(item: ReviewItem): string {
   const link = String(item.contactLink ?? "").trim();
   if (phone || link) {
     lines.push("");
-    lines.push("Contactos");
-    if (phone) pushLine("Telefono", phone);
-    if (link) pushLine("Link", link);
+    lines.push("📲 Contactos");
+    if (phone) pushKV("📞", "Telefono", phone);
+    if (link) pushKV("🔗", "Link", link);
   }
 
   return lines.join("\n").trim();
@@ -3551,32 +3884,19 @@ function formatReviewTemplateFromDraft(draft: ReviewDraft): string {
     id: "draft",
     createdAt: draft.createdAt,
     createdBy: draft.chatId,
+    department: draft.department,
     city: draft.city,
     title: draft.title || reviewTitleFromDraft(draft),
     tags: draft.tags?.length ? draft.tags : buildReviewTagsFromDraft(draft),
     raw: draft.raw || draft.comment || "",
     story: draft.story || "",
     subjectName: draft.subjectName,
-    age: draft.age,
-    skinColor: draft.skinColor,
-    height: draft.height,
-    face: draft.face,
-    breasts: draft.breasts,
-    butt: draft.butt,
     photosMatch: draft.photosMatch,
     physicalScore: draft.physicalScore,
-    hygiene: draft.hygiene,
-    kisses: draft.kisses,
-    oralCondition: draft.oralCondition,
-    oralQuality: draft.oralQuality,
-    analOffer: draft.analOffer,
-    analQuality: draft.analQuality,
     serviceScore: draft.serviceScore,
     serviceTime: draft.serviceTime,
     rateCop: draft.rateCop,
     place: draft.place,
-    payOnEntry: draft.payOnEntry,
-    siteQuality: draft.siteQuality,
     finalScore: computeFinalScore(draft.physicalScore, draft.serviceScore),
     comment: draft.comment,
     phone: draft.phone,
@@ -3591,285 +3911,142 @@ function buildReviewInlineKeyboard(env: Env, reviewId: string): any {
     ? [{ text: "Abrir", url: `${base}/r/${reviewId}` }, { text: "Leer", callback_data: `rvw:read:${reviewId}` }]
     : [{ text: "Leer", callback_data: `rvw:read:${reviewId}` }];
   const row2 = [
-    { text: "Buena (+)", callback_data: `rvw:vote:up:${reviewId}` },
-    { text: "Mala (-)", callback_data: `rvw:vote:down:${reviewId}` }
+    { text: "🔥 Buena (5⭐)", callback_data: `rvw:vote:up:${reviewId}` },
+    { text: "🥶 Mala (1⭐)", callback_data: `rvw:vote:down:${reviewId}` }
   ];
   const row3 = [{ text: "Opinar", callback_data: `rvw:comment:${reviewId}` }];
   return { inline_keyboard: [row1, row2, row3] };
 }
 
 async function sendReviewDraftPrompt(env: Env, chatId: number, draft: ReviewDraft): Promise<void> {
-  const header = [`Ciudad: ${draft.city}`, `Modo: ${draft.mode === "full" ? "Completa" : draft.mode === "quick" ? "Rapida" : "(sin elegir)"}`].join("\n");
+  const headerLines = [
+    "🔥 Crear resena",
+    draft.department ? `🏞️ Depto: ${draft.department}` : "",
+    `🏙️ Ciudad: ${draft.city}`
+  ].filter(Boolean);
+  const header = headerLines.join("\n");
 
-  if (draft.step === "await_mode") {
-    await tgSendMessage(env, chatId, [header, "", "Quiere hacer resena rapida o completa?"].join("\n"), true, {
-      inline_keyboard: [
-        [{ text: "Rapida (recomendada)", callback_data: "rvw:mode:quick" }],
-        [{ text: "Completa (plantilla)", callback_data: "rvw:mode:full" }],
-        [{ text: "Cancelar", callback_data: "rvw:cancel" }]
-      ]
-    });
-    return;
-  }
+  const cancelRow = [{ text: "Cancelar", callback_data: "rvw:cancel" }];
+  const skipCancelRow = [{ text: "Saltar", callback_data: "rvw:skip" }, { text: "Cancelar", callback_data: "rvw:cancel" }];
 
   if (draft.step === "await_name") {
-    await tgSendMessage(env, chatId, [header, "", "Mande el nombre/apodo (1 mensaje).", "Ej: Luna"].join("\n"), true, {
-      inline_keyboard: [[{ text: "Saltar", callback_data: "rvw:skip" }, { text: "Cancelar", callback_data: "rvw:cancel" }]]
-    });
-    return;
-  }
-
-  if (draft.step === "await_age") {
-    await tgSendMessage(env, chatId, [header, "", "Edad aproximada? (solo numero)", "Ej: 23"].join("\n"), true, {
-      inline_keyboard: [[{ text: "Saltar", callback_data: "rvw:skip" }, { text: "Cancelar", callback_data: "rvw:cancel" }]]
-    });
-    return;
-  }
-
-  if (draft.step === "pick_skin") {
-    await tgSendMessage(env, chatId, [header, "", "Color de piel?"].join("\n"), true, {
-      inline_keyboard: [
-        [{ text: "Blanca", callback_data: "rvw:set:skin:Blanca" }, { text: "Morena", callback_data: "rvw:set:skin:Morena" }],
-        [{ text: "Triguena", callback_data: "rvw:set:skin:Triguena" }, { text: "Negra", callback_data: "rvw:set:skin:Negra" }],
-        [{ text: "Saltar", callback_data: "rvw:skip" }, { text: "Cancelar", callback_data: "rvw:cancel" }]
-      ]
-    });
-    return;
-  }
-
-  if (draft.step === "await_height") {
-    await tgSendMessage(env, chatId, [header, "", "Estatura? (ej: 1.65 o 165)"].join("\n"), true, {
-      inline_keyboard: [[{ text: "Saltar", callback_data: "rvw:skip" }, { text: "Cancelar", callback_data: "rvw:cancel" }]]
-    });
-    return;
-  }
-
-  if (draft.step === "pick_face") {
-    await tgSendMessage(env, chatId, [header, "", "Cara?"].join("\n"), true, {
-      inline_keyboard: [
-        [
-          { text: "Bonita", callback_data: "rvw:set:face:Bonita" },
-          { text: "Regular", callback_data: "rvw:set:face:Regular" },
-          { text: "Fea", callback_data: "rvw:set:face:Fea" }
-        ],
-        [{ text: "Saltar", callback_data: "rvw:skip" }, { text: "Cancelar", callback_data: "rvw:cancel" }]
-      ]
-    });
-    return;
-  }
-
-  if (draft.step === "pick_breasts") {
-    await tgSendMessage(env, chatId, [header, "", "Senos?"].join("\n"), true, {
-      inline_keyboard: [
-        [
-          { text: "Pequenos", callback_data: "rvw:set:breasts:Pequenos" },
-          { text: "Grandes", callback_data: "rvw:set:breasts:Grandes" }
-        ],
-        [
-          { text: "Operados", callback_data: "rvw:set:breasts:Operados" },
-          { text: "Naturales", callback_data: "rvw:set:breasts:Naturales" }
-        ],
-        [{ text: "Saltar", callback_data: "rvw:skip" }, { text: "Cancelar", callback_data: "rvw:cancel" }]
-      ]
-    });
-    return;
-  }
-
-  if (draft.step === "pick_butt") {
-    await tgSendMessage(env, chatId, [header, "", "Cola?"].join("\n"), true, {
-      inline_keyboard: [
-        [
-          { text: "Redonda", callback_data: "rvw:set:butt:Redonda" },
-          { text: "Plana", callback_data: "rvw:set:butt:Plana" }
-        ],
-        [
-          { text: "Operada", callback_data: "rvw:set:butt:Operada" },
-          { text: "Natural", callback_data: "rvw:set:butt:Natural" }
-        ],
-        [{ text: "Saltar", callback_data: "rvw:skip" }, { text: "Cancelar", callback_data: "rvw:cancel" }]
-      ]
+    await tgSendMessage(env, chatId, [header, "", "👤 Nombre/apodo (1 mensaje).", "Ej: Luna"].join("\n"), true, {
+      inline_keyboard: [skipCancelRow]
     });
     return;
   }
 
   if (draft.step === "pick_photos") {
-    await tgSendMessage(env, chatId, [header, "", "Es como las fotos?"].join("\n"), true, {
+    await tgSendMessage(env, chatId, [header, "", "📸 Era como en las fotos?"].join("\n"), true, {
       inline_keyboard: [
         [{ text: "Si", callback_data: "rvw:set:photos:Si" }, { text: "No", callback_data: "rvw:set:photos:No" }],
-        [{ text: "Saltar", callback_data: "rvw:skip" }, { text: "Cancelar", callback_data: "rvw:cancel" }]
+        skipCancelRow
       ]
     });
     return;
   }
 
   if (draft.step === "pick_physical_score") {
-    const row1 = [1, 2, 3, 4, 5].map((n) => ({ text: String(n), callback_data: `rvw:num:physical:${n}` }));
-    const row2 = [6, 7, 8, 9, 10].map((n) => ({ text: String(n), callback_data: `rvw:num:physical:${n}` }));
-    await tgSendMessage(env, chatId, [header, "", "Calificacion del fisico (1-10)?"].join("\n"), true, {
-      inline_keyboard: [row1, row2, [{ text: "Saltar", callback_data: "rvw:skip" }, { text: "Cancelar", callback_data: "rvw:cancel" }]]
-    });
-    return;
-  }
-
-  if (draft.step === "pick_hygiene") {
-    await tgSendMessage(env, chatId, [header, "", "Aseo y bioseguridad?"].join("\n"), true, {
+    await tgSendMessage(env, chatId, [header, "", "🔥 Fisico: cuantas estrellas le pone?"].join("\n"), true, {
       inline_keyboard: [
-        [{ text: "Aseada", callback_data: "rvw:set:hyg:Aseada" }, { text: "Desarreglada", callback_data: "rvw:set:hyg:Desarreglada" }],
-        [{ text: "Saltar", callback_data: "rvw:skip" }, { text: "Cancelar", callback_data: "rvw:cancel" }]
-      ]
-    });
-    return;
-  }
-
-  if (draft.step === "pick_kisses") {
-    await tgSendMessage(env, chatId, [header, "", "Da besos?"].join("\n"), true, {
-      inline_keyboard: [
-        [{ text: "Si", callback_data: "rvw:set:kisses:Si" }, { text: "No", callback_data: "rvw:set:kisses:No" }],
-        [{ text: "Con lengua", callback_data: "rvw:set:kisses:Con lengua" }, { text: "Solo picos", callback_data: "rvw:set:kisses:Solo picos" }],
-        [{ text: "Saltar", callback_data: "rvw:skip" }, { text: "Cancelar", callback_data: "rvw:cancel" }]
-      ]
-    });
-    return;
-  }
-
-  if (draft.step === "pick_oral_condition") {
-    await tgSendMessage(env, chatId, [header, "", "Condicion del oral?"].join("\n"), true, {
-      inline_keyboard: [
-        [{ text: "Preservativo", callback_data: "rvw:set:oralcond:Preservativo" }, { text: "Natural", callback_data: "rvw:set:oralcond:Natural" }],
-        [{ text: "Saltar", callback_data: "rvw:skip" }, { text: "Cancelar", callback_data: "rvw:cancel" }]
-      ]
-    });
-    return;
-  }
-
-  if (draft.step === "pick_oral_quality") {
-    await tgSendMessage(env, chatId, [header, "", "Calidad del oral?"].join("\n"), true, {
-      inline_keyboard: [
-        [{ text: "Bueno", callback_data: "rvw:set:oralq:Bueno" }, { text: "Regular", callback_data: "rvw:set:oralq:Regular" }, { text: "Malo", callback_data: "rvw:set:oralq:Malo" }],
-        [{ text: "Saltar", callback_data: "rvw:skip" }, { text: "Cancelar", callback_data: "rvw:cancel" }]
-      ]
-    });
-    return;
-  }
-
-  if (draft.step === "pick_anal_offer") {
-    await tgSendMessage(env, chatId, [header, "", "Ofrece anal?"].join("\n"), true, {
-      inline_keyboard: [
-        [{ text: "Si", callback_data: "rvw:set:anal:Si" }, { text: "No", callback_data: "rvw:set:anal:No" }, { text: "Adicional", callback_data: "rvw:set:anal:Adicional" }],
-        [{ text: "Saltar", callback_data: "rvw:skip" }, { text: "Cancelar", callback_data: "rvw:cancel" }]
-      ]
-    });
-    return;
-  }
-
-  if (draft.step === "pick_anal_quality") {
-    await tgSendMessage(env, chatId, [header, "", "Calidad del anal?"].join("\n"), true, {
-      inline_keyboard: [
-        [{ text: "Bueno", callback_data: "rvw:set:analq:Bueno" }, { text: "Regular", callback_data: "rvw:set:analq:Regular" }, { text: "Malo", callback_data: "rvw:set:analq:Malo" }],
-        [{ text: "Saltar", callback_data: "rvw:skip" }, { text: "Cancelar", callback_data: "rvw:cancel" }]
+        [
+          { text: "⭐", callback_data: "rvw:num:physical:2" },
+          { text: "⭐⭐", callback_data: "rvw:num:physical:4" },
+          { text: "⭐⭐⭐", callback_data: "rvw:num:physical:6" },
+          { text: "⭐⭐⭐⭐", callback_data: "rvw:num:physical:8" },
+          { text: "⭐⭐⭐⭐⭐", callback_data: "rvw:num:physical:10" }
+        ],
+        skipCancelRow
       ]
     });
     return;
   }
 
   if (draft.step === "pick_service_score") {
-    const row1 = [1, 2, 3, 4, 5].map((n) => ({ text: String(n), callback_data: `rvw:num:service:${n}` }));
-    const row2 = [6, 7, 8, 9, 10].map((n) => ({ text: String(n), callback_data: `rvw:num:service:${n}` }));
-    await tgSendMessage(env, chatId, [header, "", "Calificacion del servicio (1-10)?"].join("\n"), true, {
-      inline_keyboard: [row1, row2, [{ text: "Saltar", callback_data: "rvw:skip" }, { text: "Cancelar", callback_data: "rvw:cancel" }]]
+    await tgSendMessage(env, chatId, [header, "", "😈 Servicio: cuantas estrellas le pone?"].join("\n"), true, {
+      inline_keyboard: [
+        [
+          { text: "⭐", callback_data: "rvw:num:service:2" },
+          { text: "⭐⭐", callback_data: "rvw:num:service:4" },
+          { text: "⭐⭐⭐", callback_data: "rvw:num:service:6" },
+          { text: "⭐⭐⭐⭐", callback_data: "rvw:num:service:8" },
+          { text: "⭐⭐⭐⭐⭐", callback_data: "rvw:num:service:10" }
+        ],
+        skipCancelRow
+      ]
     });
     return;
   }
 
   if (draft.step === "pick_service_time") {
-    await tgSendMessage(env, chatId, [header, "", "Tiempo del servicio?"].join("\n"), true, {
+    await tgSendMessage(env, chatId, [header, "", "⏱️ Tiempo del servicio?"].join("\n"), true, {
       inline_keyboard: [
-        [{ text: "Rato", callback_data: "rvw:set:time:Rato" }, { text: "1/2 hora", callback_data: "rvw:set:time:1/2 Hora" }],
-        [{ text: "1 hora", callback_data: "rvw:set:time:1 Hora" }, { text: "Otro", callback_data: "rvw:set:time:Otro" }],
-        [{ text: "Saltar", callback_data: "rvw:skip" }, { text: "Cancelar", callback_data: "rvw:cancel" }]
+        [{ text: "Rato", callback_data: "rvw:set:time:Rato" }, { text: "1/2 Hora", callback_data: "rvw:set:time:1/2 Hora" }],
+        [{ text: "1 Hora", callback_data: "rvw:set:time:1 Hora" }],
+        skipCancelRow
       ]
     });
     return;
   }
 
   if (draft.step === "await_rate") {
-    await tgSendMessage(env, chatId, [header, "", "Tarifa? (solo numero, COP)", "Ej: 150000"].join("\n"), true, {
-      inline_keyboard: [[{ text: "Saltar", callback_data: "rvw:skip" }, { text: "Cancelar", callback_data: "rvw:cancel" }]]
+    await tgSendMessage(env, chatId, [header, "", "💸 Cuanto pago? (solo numero en pesos)", "Ej: 150000"].join("\n"), true, {
+      inline_keyboard: [skipCancelRow]
     });
     return;
   }
 
   if (draft.step === "pick_place") {
-    await tgSendMessage(env, chatId, [header, "", "En donde fue el servicio?"].join("\n"), true, {
+    await tgSendMessage(env, chatId, [header, "", "🏨 En donde fue el servicio?"].join("\n"), true, {
       inline_keyboard: [
         [{ text: "Hotel", callback_data: "rvw:set:place:Hotel" }, { text: "Motel", callback_data: "rvw:set:place:Motel" }],
         [{ text: "Apartamento", callback_data: "rvw:set:place:Apartamento" }, { text: "Domicilio", callback_data: "rvw:set:place:Domicilio" }],
-        [{ text: "Otro", callback_data: "rvw:set:place:Otro" }, { text: "Saltar", callback_data: "rvw:skip" }],
-        [{ text: "Cancelar", callback_data: "rvw:cancel" }]
-      ]
-    });
-    return;
-  }
-
-  if (draft.step === "pick_pay_on_entry") {
-    await tgSendMessage(env, chatId, [header, "", "Se paga al ingresar?"].join("\n"), true, {
-      inline_keyboard: [
-        [{ text: "Si", callback_data: "rvw:set:pay:Si" }, { text: "No", callback_data: "rvw:set:pay:No" }],
-        [{ text: "Saltar", callback_data: "rvw:skip" }, { text: "Cancelar", callback_data: "rvw:cancel" }]
-      ]
-    });
-    return;
-  }
-
-  if (draft.step === "pick_site_quality") {
-    await tgSendMessage(env, chatId, [header, "", "Calidad del sitio?"].join("\n"), true, {
-      inline_keyboard: [
-        [{ text: "Bueno", callback_data: "rvw:set:site:Bueno" }, { text: "Regular", callback_data: "rvw:set:site:Regular" }, { text: "Malo", callback_data: "rvw:set:site:Malo" }],
-        [{ text: "Saltar", callback_data: "rvw:skip" }, { text: "Cancelar", callback_data: "rvw:cancel" }]
+        skipCancelRow
       ]
     });
     return;
   }
 
   if (draft.step === "await_comment") {
-    await tgSendMessage(env, chatId, [header, "", "Comentario general (en sus palabras).", "Tip: 1 mensaje, sin pena."].join("\n"), true, {
-      inline_keyboard: [[{ text: "Saltar", callback_data: "rvw:skip" }, { text: "Cancelar", callback_data: "rvw:cancel" }]]
+    await tgSendMessage(env, chatId, [header, "", "🗣️ Comentario general (en sus palabras).", "Tip: 1 mensaje, sin pena."].join("\n"), true, {
+      inline_keyboard: [skipCancelRow]
     });
     return;
   }
 
   if (draft.step === "await_phone") {
-    await tgSendMessage(env, chatId, [header, "", "Telefono (opcional).", "Ej: 3001234567"].join("\n"), true, {
-      inline_keyboard: [[{ text: "Saltar", callback_data: "rvw:skip" }, { text: "Cancelar", callback_data: "rvw:cancel" }]]
+    await tgSendMessage(env, chatId, [header, "", "📞 Telefono (opcional).", "Ej: 3001234567"].join("\n"), true, {
+      inline_keyboard: [skipCancelRow]
     });
     return;
   }
 
   if (draft.step === "await_contact_link") {
-    await tgSendMessage(env, chatId, [header, "", "Link web/contacto (opcional).", "Ej: https://..."].join("\n"), true, {
-      inline_keyboard: [[{ text: "Saltar", callback_data: "rvw:skip" }, { text: "Cancelar", callback_data: "rvw:cancel" }]]
+    await tgSendMessage(env, chatId, [header, "", "🔗 Link web/contacto (opcional).", "Ej: https://..."].join("\n"), true, {
+      inline_keyboard: [skipCancelRow]
     });
     return;
   }
 
   if (draft.step === "confirm") {
     const preview = formatReviewTemplateFromDraft(draft);
-    await tgSendMessage(env, chatId, ["Asi va quedando:", "", truncate(preview, 3200), "", "Si esta bien, publique."].join("\n"), true, {
-      inline_keyboard: [[
-        { text: "Publicar", callback_data: "rvw:publish" },
-        { text: "Empezar de nuevo", callback_data: "rvw:restart" },
-        { text: "Cancelar", callback_data: "rvw:cancel" }
-      ]]
+    await tgSendMessage(env, chatId, ["🔥 Asi va quedando:", "", truncate(preview, 3200), "", "Si esta bien, publiquela pues."].join("\n"), true, {
+      inline_keyboard: [
+        [
+          { text: "Publicar 🔥", callback_data: "rvw:publish" },
+          { text: "Empezar de nuevo", callback_data: "rvw:restart" }
+        ],
+        cancelRow
+      ]
     });
     return;
   }
 
-  await tgSendMessage(env, chatId, "Toque un boton o /cancel.", true, { inline_keyboard: [[{ text: "Cancelar", callback_data: "rvw:cancel" }]] });
+  await tgSendMessage(env, chatId, "Toque un boton o /cancel.", true, { inline_keyboard: [cancelRow] });
 }
 
 function nextDraftStep(draft: ReviewDraft): ReviewDraft["step"] {
-  const mode = draft.mode === "full" ? "full" : "quick";
-  const flow = reviewFlowSteps(mode);
+  const flow = reviewFlowSteps();
   const idx = flow.indexOf(draft.step);
   if (idx === -1) return "confirm";
   const next = flow[idx + 1];
@@ -3880,19 +4057,6 @@ async function advanceReviewDraft(env: Env, chatId: number, draft: ReviewDraft):
   const next: ReviewDraft = { ...draft, step: nextDraftStep(draft), updatedAt: nowSec() };
   next.title = reviewTitleFromDraft(next);
   next.tags = buildReviewTagsFromDraft(next);
-
-  // Best-effort: improve the free-text comment with DeepSeek right before confirmation,
-  // so the preview shows the final narrative.
-  if (next.step === "confirm") {
-    const apiKey = String(env.DEEPSEEK_API_KEY ?? "").trim();
-    const raw = String(next.raw ?? next.comment ?? "").trim();
-    const hasStory = String(next.story ?? "").trim();
-    if (apiKey && raw && !hasStory) {
-      const improved = await improveReviewWithDeepSeek(env, { city: next.city, title: next.title || "", raw });
-      const story = clipText(String(improved ?? "").trim(), 2000);
-      if (story) next.story = story;
-    }
-  }
 
   await putReviewDraft(env, next);
   await sendReviewDraftPrompt(env, chatId, next);
@@ -3916,21 +4080,13 @@ async function applyReviewDraftPick(
   }
 
   const next: ReviewDraft = { ...draft, updatedAt: nowSec() };
-  if (key === "skin") next.skinColor = val;
-  else if (key === "face") next.face = val;
-  else if (key === "breasts") next.breasts = val;
-  else if (key === "butt") next.butt = val;
-  else if (key === "photos") next.photosMatch = val;
-  else if (key === "hyg") next.hygiene = val;
-  else if (key === "kisses") next.kisses = val;
-  else if (key === "oralcond") next.oralCondition = val;
-  else if (key === "oralq") next.oralQuality = val;
-  else if (key === "anal") next.analOffer = val;
-  else if (key === "analq") next.analQuality = val;
+  if (key === "photos") next.photosMatch = val;
   else if (key === "time") next.serviceTime = val;
   else if (key === "place") next.place = val;
-  else if (key === "pay") next.payOnEntry = val;
-  else if (key === "site") next.siteQuality = val;
+  else {
+    await sendReviewDraftPrompt(env, chatId, draft);
+    return;
+  }
 
   next.step = nextDraftStep(next);
   next.title = reviewTitleFromDraft(next);
@@ -3978,32 +4134,19 @@ async function publishReviewFromDraft(env: Env, chatId: number, draft: ReviewDra
     id: randomTokenHex(8),
     createdAt: nowSec(),
     createdBy: chatId,
+    department: draft.department,
     city: draft.city,
     title,
     tags,
     raw: raw,
     story: story,
     subjectName: draft.subjectName,
-    age: draft.age,
-    skinColor: draft.skinColor,
-    height: draft.height,
-    face: draft.face,
-    breasts: draft.breasts,
-    butt: draft.butt,
     photosMatch: draft.photosMatch,
     physicalScore: draft.physicalScore,
-    hygiene: draft.hygiene,
-    kisses: draft.kisses,
-    oralCondition: draft.oralCondition,
-    oralQuality: draft.oralQuality,
-    analOffer: draft.analOffer,
-    analQuality: draft.analQuality,
     serviceScore: draft.serviceScore,
     serviceTime: draft.serviceTime,
     rateCop: draft.rateCop,
     place: draft.place,
-    payOnEntry: draft.payOnEntry,
-    siteQuality: draft.siteQuality,
     finalScore: computeFinalScore(draft.physicalScore, draft.serviceScore),
     comment: draft.comment,
     phone: draft.phone,
@@ -4049,15 +4192,17 @@ async function sendLatestReviews(env: Env, user: UserConfig, chatId: number, lim
 
 function formatLatestReviewItemText(it: ReviewIndexEntry, idx: number, total: number): string {
   const lines: string[] = [];
-  lines.push(`Pilas pues resenas (${idx}/${total})`);
-  lines.push(`[${it.city}] ${truncate(it.title || it.subjectName || it.id, 180)}`);
+  lines.push(`🔥 Resenas (${idx}/${total})`);
+  lines.push(`🏙️ [${it.city}] ${truncate(it.title || it.subjectName || it.id, 180)}`);
   if (it.createdAt) {
     lines.push(`Fecha: ${formatCoDateTimeFromSec(it.createdAt)}`);
   }
   const up = typeof it.votesUp === "number" ? it.votesUp : 0;
   const down = typeof it.votesDown === "number" ? it.votesDown : 0;
   const cc = typeof it.commentsCount === "number" ? it.commentsCount : 0;
-  if (up || down || cc) lines.push(`Votos: +${up} / -${down} | Opiniones: ${cc}`);
+  const stars = votesToStars(up, down);
+  if (stars.count > 0) lines.push(`⭐ Calificacion: ${stars.stars} ${stars.avg.toFixed(1)}/5 (${stars.count} votos)`);
+  if (cc > 0) lines.push(`💬 Opiniones: ${cc}`);
   return lines.join("\n");
 }
 
@@ -4071,12 +4216,15 @@ async function sendReviewRead(env: Env, chatId: number, id: string): Promise<voi
   const votesUp = Number(item.votesUp ?? 0);
   const votesDown = Number(item.votesDown ?? 0);
   const commentsCount = Number(item.commentsCount ?? 0);
+  const stars = votesToStars(votesUp, votesDown);
 
   const lines: string[] = [];
-  lines.push(item.title);
-  lines.push(`Ciudad: ${item.city}`);
-  lines.push(`Fecha: ${formatCoDateTimeFromSec(item.createdAt)}`);
-  lines.push(`Votos: +${votesUp} / -${votesDown} | Opiniones: ${commentsCount}`);
+  lines.push(`🔥 ${item.title}`);
+  lines.push(`🏙️ Ciudad: ${item.city}`);
+  lines.push(`🗓️ Fecha: ${formatCoDateTimeFromSec(item.createdAt)}`);
+  if (stars.count > 0) lines.push(`⭐ Calificacion: ${stars.stars} ${stars.avg.toFixed(1)}/5 (${stars.count} votos)`);
+  else lines.push("⭐ Calificacion: (sin votos todavia)");
+  if (commentsCount > 0) lines.push(`💬 Opiniones: ${commentsCount}`);
   lines.push("");
   lines.push(formatReviewTemplateFromItem(item));
 
@@ -4207,7 +4355,7 @@ async function handleSearchDraftText(env: Env, chatId: number, draft: SearchDraf
     hits = idx.filter((e) => String(e.phone ?? "").replace(/[^0-9]/g, "").includes(needleDigits));
   } else {
     hits = idx.filter((e) =>
-      normalize(`${e.city} ${e.title} ${e.subjectName ?? ""} ${e.phone ?? ""} ${e.contactLink ?? ""}`).includes(needle)
+      normalize(`${e.department ?? ""} ${e.city} ${e.title} ${e.subjectName ?? ""} ${e.phone ?? ""} ${e.contactLink ?? ""}`).includes(needle)
     );
   }
 
@@ -4229,7 +4377,7 @@ async function handleSearchDraftText(env: Env, chatId: number, draft: SearchDraf
 
 function matchesUserForReviewEntry(u: UserConfig, e: ReviewIndexEntry): boolean {
   if (u.includeKeywords.length === 0) return false;
-  const text = normalize(`${e.city} ${e.title} ${e.subjectName ?? ""} ${e.phone ?? ""} ${e.contactLink ?? ""}`);
+  const text = normalize(`${e.department ?? ""} ${e.city} ${e.title} ${e.subjectName ?? ""} ${e.phone ?? ""} ${e.contactLink ?? ""}`);
 
   for (const k of u.excludeKeywords) {
     if (!k) continue;
@@ -4254,34 +4402,6 @@ async function handleReviewDraftText(env: Env, chatId: number, draft: ReviewDraf
   if (draft.step === "await_name") {
     const name = truncate(text, 60);
     const next: ReviewDraft = { ...draft, subjectName: name, updatedAt: nowSec() };
-    await putReviewDraft(env, next);
-    await advanceReviewDraft(env, chatId, next);
-    return;
-  }
-
-  if (draft.step === "await_age") {
-    const age = parseAge(text);
-    if (!age) {
-      await tgSendMessage(env, chatId, "Mande un numero valido (18-70) o toque Saltar.", true, {
-        inline_keyboard: [[{ text: "Saltar", callback_data: "rvw:skip" }, { text: "Cancelar", callback_data: "rvw:cancel" }]]
-      });
-      return;
-    }
-    const next: ReviewDraft = { ...draft, age, updatedAt: nowSec() };
-    await putReviewDraft(env, next);
-    await advanceReviewDraft(env, chatId, next);
-    return;
-  }
-
-  if (draft.step === "await_height") {
-    const height = parseHeight(text);
-    if (!height) {
-      await tgSendMessage(env, chatId, "Asi: 1.65 o 165 (cm). O toque Saltar.", true, {
-        inline_keyboard: [[{ text: "Saltar", callback_data: "rvw:skip" }, { text: "Cancelar", callback_data: "rvw:cancel" }]]
-      });
-      return;
-    }
-    const next: ReviewDraft = { ...draft, height, updatedAt: nowSec() };
     await putReviewDraft(env, next);
     await advanceReviewDraft(env, chatId, next);
     return;
@@ -4347,50 +4467,6 @@ function clipText(s: string, max: number): string {
   return text.slice(0, max).trimEnd();
 }
 
-async function improveReviewWithDeepSeek(env: Env, input: { city: string; title: string; raw: string }): Promise<string> {
-  const apiKey = String(env.DEEPSEEK_API_KEY ?? "").trim();
-  if (!apiKey) return input.raw;
-
-  const base = String(env.DEEPSEEK_BASE_URL ?? "https://api.deepseek.com").trim().replace(/\/+$/g, "");
-  const model = String(env.DEEPSEEK_MODEL ?? "deepseek-chat").trim() || "deepseek-chat";
-
-  const system = [
-    "Eres un editor.",
-    "Reescribe el texto del usuario en espanol colombiano, con buena redaccion y fluidez.",
-    "No inventes datos ni agregues detalles nuevos.",
-    "No uses Markdown. No uses listas largas.",
-    "Mantenga palabras fuertes si el usuario las puso (no censures).",
-    "Maximo 6 parrafos cortos."
-  ].join(" ");
-
-  const user = [`Ciudad: ${input.city}`, `Titulo: ${input.title}`, "", input.raw].join("\n");
-
-  try {
-    const res = await fetch(`${base}/v1/chat/completions`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "authorization": `Bearer ${apiKey}`
-      },
-      body: JSON.stringify({
-        model,
-        messages: [
-          { role: "system", content: system },
-          { role: "user", content: clipText(user, 1800) }
-        ],
-        temperature: 0.7,
-        max_tokens: 260
-      })
-    });
-    const data = (await res.json().catch(() => null)) as any;
-    const out = data?.choices?.[0]?.message?.content;
-    const text = typeof out === "string" ? out.trim() : "";
-    return text || input.raw;
-  } catch {
-    return input.raw;
-  }
-}
-
 async function notifyUsersAboutReview(env: Env, item: ReviewItem): Promise<void> {
   const chatIds = await getUserChatIds(env);
   if (chatIds.length === 0) return;
@@ -4421,10 +4497,13 @@ async function notifyUsersAboutReview(env: Env, item: ReviewItem): Promise<void>
     const keyboard = buildReviewInlineKeyboard(env, item.id);
     const votesUp = Number(item.votesUp ?? 0);
     const votesDown = Number(item.votesDown ?? 0);
+    const stars = votesToStars(votesUp, votesDown);
+    const ratingLine =
+      stars.count > 0 ? `⭐ Calificacion: ${stars.stars} ${stars.avg.toFixed(1)}/5 (${stars.count} votos)` : "⭐ Calificacion: (sin votos)";
     await tgSendMessage(
       env,
       u.chatId,
-      `Pilas pues: nueva resena\n[${item.city}] ${item.title}\nVotos: +${votesUp} / -${votesDown}`,
+      `🔥 Pilas pues: resena nueva\n🏙️ [${item.city}] ${item.title}\n${ratingLine}`,
       true,
       keyboard
     );
@@ -4447,6 +4526,7 @@ async function handleReviewPage(request: Request, env: Env): Promise<Response> {
   const votesUp = Math.max(0, Number(item.votesUp ?? 0));
   const votesDown = Math.max(0, Number(item.votesDown ?? 0));
   const commentsCount = Math.max(0, Number(item.commentsCount ?? 0));
+  const stars = votesToStars(votesUp, votesDown);
   const story = escapeHtml(formatReviewTemplateFromItem(item));
   const created = formatCoDateTimeFromSec(item.createdAt || 0);
 
@@ -4492,7 +4572,9 @@ async function handleReviewPage(request: Request, env: Env): Promise<Response> {
       <div class="top">
         <div>
           <h1>${title}</h1>
-          <p class="meta">Ciudad: ${city} | ${escapeHtml(created)} | Votos: +${votesUp} / -${votesDown} | Opiniones: ${commentsCount}</p>
+          <p class="meta">Ciudad: ${city} | ${escapeHtml(created)} | Calificacion: ${escapeHtml(
+            stars.count > 0 ? `${stars.stars} ${stars.avg.toFixed(1)}/5 (${stars.count} votos)` : "sin votos"
+          )} | Opiniones: ${commentsCount}</p>
         </div>
         <a class="btn" href="${escapeHtml(base)}/donar">Apoyar el proyecto</a>
       </div>
@@ -5003,3 +5085,4 @@ async function sendDonateInfo(env: Env, chatId: number, edit: boolean, messageId
   if (edit && messageId) await tgEditMessage(env, chatId, messageId, text, replyMarkup);
   else await tgSendMessage(env, chatId, text, true, replyMarkup);
 }
+
