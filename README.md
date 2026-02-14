@@ -1,6 +1,8 @@
 # radar-x
 
-Bot de Telegram para navegar y filtrar contenido de `SITE_BASE_URL` (por defecto: `https://doncolombia.com`) con alertas automaticas por usuario.
+Bot de Telegram enfocado en **resenas**: crear, buscar, votar y opinar, todo con botones (wizard).
+
+Como respaldo (cuando aun hay pocas resenas), tambien filtra y manda contenido de `SITE_BASE_URL` (por defecto: `https://doncolombia.com`).
 
 ## Seguridad (importante)
 
@@ -10,18 +12,20 @@ Si el token ya fue compartido en publico, revocalo y genera uno nuevo con BotFat
 
 ## Funciones
 
+- Resenas (principal):
+  - Wizard para crear resenas (modo rapido o completo tipo DonColombia)
+  - Buscar resena por nombre/apodo, telefono, link o ID
+  - Interaccion: votos "Buena/Mala" + opiniones (comentarios)
+  - Pagina publica por resena: `/r/<id>` (para abrir desde Telegram)
+  - IA opcional (DeepSeek) para mejorar el relato del "Comentario general" (sin inventar datos)
 - Filtros por usuario:
   - Suscripcion a foros (por URL o desde `/foros`)
   - Palabras clave (incluir / excluir)
   - Prefijos/labels (ej: "Resena", "Pregunta", etc, si el sitio los expone en HTML)
 - Notificaciones automaticas (feed):
   - Envios en tiempos aleatorios por usuario (entre 5 y 60 min)
-  - Si no hay nada nuevo para tu filtro, manda contenido mas viejo (para que siempre haya algo)
+  - Prioriza resenas propias; si no hay, manda contenido de DonColombia (y si no hay nada nuevo, manda cosas mas viejas)
   - Detecta: nuevo tema (thread) y nueva respuesta (reply) en foros/home (best-effort)
-- Resenas (dentro del bot):
-  - Crear resena por ciudad (wizard)
-  - Ver ultimas resenas filtradas por tus ciudades/temas
-  - Notifica a usuarios con filtros que coincidan
 - Donaciones (Wompi):
   - Landing `/donar` estilo "vaquita" con meta mensual y botones de $1k/$2k/$5k/$10k
   - Webhook `/wompi/webhook` para sumar aportes aprobados (APPROVED)
@@ -46,7 +50,7 @@ Si el token ya fue compartido en publico, revocalo y genera uno nuevo con BotFat
 - `/notify donations on|off`
 - `/list` (o `/filtros`)
 - `/leer <url>` (o `/read <url>`)
-- `/cancel` (cancelar una resena en curso)
+- `/cancel` (cancelar resena/opinion/busqueda en curso)
 
 ## Despliegue (Cloudflare Workers + KV + Cron)
 

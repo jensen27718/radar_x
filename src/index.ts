@@ -46,6 +46,7 @@ type UserConfig = {
   feedNextAt?: number; // epoch seconds
   feedDelivered?: string[]; // recent event keys to avoid repeats
   feedRecentThreadIds?: number[]; // recent thread ids to avoid immediate repeats
+  feedRecentReviewIds?: string[]; // recent review ids to avoid immediate repeats
 };
 
 type ThreadItem = {
@@ -100,8 +101,43 @@ type ReviewItem = {
   city: string;
   title: string;
   tags: string[];
-  raw: string;
-  story: string;
+  raw: string; // user raw text (usually "comentario general")
+  story: string; // formatted/edited narrative (optional)
+
+  // DonColombia-like structured fields (optional)
+  subjectName?: string;
+  age?: number;
+  skinColor?: string;
+  height?: string; // ex: "1.65"
+  face?: string;
+  breasts?: string;
+  butt?: string;
+  photosMatch?: string; // "Si" | "No"
+  physicalScore?: number; // 1-10
+
+  hygiene?: string;
+  kisses?: string;
+  oralCondition?: string;
+  oralQuality?: string;
+  analOffer?: string;
+  analQuality?: string;
+  serviceScore?: number; // 1-10
+
+  serviceTime?: string;
+  rateCop?: number;
+  place?: string;
+  payOnEntry?: string; // "Si" | "No"
+  siteQuality?: string;
+  finalScore?: number; // avg of physicalScore + serviceScore when available
+  comment?: string; // alias of raw, kept for clarity
+
+  phone?: string;
+  contactLink?: string;
+
+  // Community signals (best-effort counters, KV is not transactional)
+  votesUp?: number;
+  votesDown?: number;
+  commentsCount?: number;
 };
 
 type ReviewDraft = {
@@ -109,12 +145,84 @@ type ReviewDraft = {
   chatId: number;
   createdAt: number;
   updatedAt: number;
-  step: "await_title" | "await_desc" | "confirm";
+  step:
+    | "await_mode"
+    | "await_name"
+    | "await_age"
+    | "pick_skin"
+    | "await_height"
+    | "pick_face"
+    | "pick_breasts"
+    | "pick_butt"
+    | "pick_photos"
+    | "pick_physical_score"
+    | "pick_hygiene"
+    | "pick_kisses"
+    | "pick_oral_condition"
+    | "pick_oral_quality"
+    | "pick_anal_offer"
+    | "pick_anal_quality"
+    | "pick_service_score"
+    | "pick_service_time"
+    | "await_rate"
+    | "pick_place"
+    | "pick_pay_on_entry"
+    | "pick_site_quality"
+    | "await_comment"
+    | "await_phone"
+    | "await_contact_link"
+    | "confirm";
   city: string;
+  mode?: "quick" | "full";
+
+  subjectName?: string;
+  age?: number;
+  skinColor?: string;
+  height?: string;
+  face?: string;
+  breasts?: string;
+  butt?: string;
+  photosMatch?: string;
+  physicalScore?: number;
+
+  hygiene?: string;
+  kisses?: string;
+  oralCondition?: string;
+  oralQuality?: string;
+  analOffer?: string;
+  analQuality?: string;
+  serviceScore?: number;
+
+  serviceTime?: string;
+  rateCop?: number;
+  place?: string;
+  payOnEntry?: string;
+  siteQuality?: string;
+  comment?: string;
+  phone?: string;
+  contactLink?: string;
+
   title?: string;
   raw?: string;
   story?: string;
   tags?: string[];
+};
+
+type CommentDraft = {
+  v: 1;
+  chatId: number;
+  createdAt: number;
+  updatedAt: number;
+  step: "await_text";
+  reviewId: string;
+};
+
+type SearchDraft = {
+  v: 1;
+  chatId: number;
+  createdAt: number;
+  updatedAt: number;
+  step: "await_query";
 };
 
 type DonationMonth = {
@@ -133,6 +241,11 @@ const POLL_STATE_KEY = "state:poll";
 const REVIEWS_INDEX_KEY = "reviews:index";
 const REVIEW_KEY_PREFIX = "review:";
 const REVIEW_DRAFT_KEY_PREFIX = "draft:review:";
+const COMMENT_DRAFT_KEY_PREFIX = "draft:comment:";
+const SEARCH_DRAFT_KEY_PREFIX = "draft:search:";
+const REVIEW_VOTE_KEY_PREFIX = "reviewvote:";
+const REVIEW_COMMENT_KEY_PREFIX = "reviewcomment:";
+const REVIEW_COMMENTS_INDEX_KEY_PREFIX = "reviewcomments:index:";
 
 const DONATIONS_MONTH_KEY_PREFIX = "donations:month:";
 const DONATIONS_TX_KEY_PREFIX = "donations:tx:";
@@ -149,6 +262,7 @@ const FEED_MAX_DELAY_MIN = 60;
 const FEED_EVENTS_MAX = 550;
 const FEED_DELIVERED_MAX = 140;
 const FEED_RECENT_THREAD_MAX = 70;
+const FEED_RECENT_REVIEW_MAX = 70;
 const FEED_MAX_SENDS_PER_RUN = 18;
 
 const CITY_PRESETS: { id: string; name: string }[] = [
@@ -627,7 +741,7 @@ function hasPositiveFilters(u: UserConfig): boolean {
 function isUserFeedEnabled(u: UserConfig): boolean {
   // If the user has no positive filters, don't spam them with the whole site.
   if (!hasPositiveFilters(u)) return false;
-  return Boolean(u.notifyThreads || u.notifyReplies);
+  return Boolean(u.notifyReviews || u.notifyThreads || u.notifyReplies);
 }
 
 function userWantsFeedEvent(u: UserConfig, e: FeedEvent): boolean {
@@ -660,7 +774,7 @@ function scheduleFeedSoonAt(nowSec: number): number {
 async function runUserFeedNotifications(env: Env, state: PollState, users: UserConfig[], nowMs: number): Promise<void> {
   const now = Math.floor(nowMs / 1000);
   const events = Array.isArray(state.events) ? state.events : [];
-  if (events.length === 0) return;
+  const reviewIdx = await getReviewIndex(env);
 
   let sent = 0;
   for (const u of users) {
@@ -670,7 +784,13 @@ async function runUserFeedNotifications(env: Env, state: PollState, users: UserC
     const nextAt = typeof u.feedNextAt === "number" ? u.feedNextAt : 0;
     if (!nextAt || nextAt <= 0) {
       // First-time schedule: don't send immediately, keep the 5-60 min rhythm.
-      await putUser(env, { ...u, feedNextAt: scheduleFeedSoonAt(now), feedDelivered: u.feedDelivered ?? [], feedRecentThreadIds: u.feedRecentThreadIds ?? [] });
+      await putUser(env, {
+        ...u,
+        feedNextAt: scheduleFeedSoonAt(now),
+        feedDelivered: u.feedDelivered ?? [],
+        feedRecentThreadIds: u.feedRecentThreadIds ?? [],
+        feedRecentReviewIds: u.feedRecentReviewIds ?? []
+      });
       continue;
     }
 
@@ -680,6 +800,64 @@ async function runUserFeedNotifications(env: Env, state: PollState, users: UserC
     const deliveredSet = new Set(delivered);
     const recent = Array.isArray(u.feedRecentThreadIds) ? u.feedRecentThreadIds : [];
     const recentSet = new Set(recent);
+    const recentReviews = Array.isArray(u.feedRecentReviewIds) ? u.feedRecentReviewIds : [];
+    const recentReviewSet = new Set(recentReviews);
+
+    const nextAt2 = scheduleNextFeedAt(now);
+
+    // 1) Prefer own reviews.
+    if (u.notifyReviews && u.includeKeywords.length > 0 && reviewIdx.length > 0) {
+      const matches = reviewIdx.filter((e) => matchesUserForReviewEntry(u, e));
+      let pickedReview: ReviewIndexEntry | null = null;
+      let repeat = false;
+
+      for (const it of matches) {
+        const key = `r:${it.id}`;
+        if (deliveredSet.has(key)) continue;
+        if (recentReviewSet.has(it.id)) continue;
+        pickedReview = it;
+        break;
+      }
+
+      if (!pickedReview && matches.length > 0) {
+        const pool = matches.filter((it) => !recentReviewSet.has(it.id));
+        const arr = pool.length > 0 ? pool : matches;
+        pickedReview = arr[randomIntInRange(0, arr.length - 1)];
+        repeat = true;
+      }
+
+      if (pickedReview) {
+        await sendFeedReviewAlert(env, u.chatId, pickedReview, { isRepeat: repeat });
+
+        const nextDelivered = [...delivered, `r:${pickedReview.id}`];
+        const trimmedDelivered = nextDelivered.slice(Math.max(0, nextDelivered.length - FEED_DELIVERED_MAX));
+
+        const nextRecentReviews = [...recentReviews, pickedReview.id];
+        const trimmedRecentReviews = nextRecentReviews.slice(Math.max(0, nextRecentReviews.length - FEED_RECENT_REVIEW_MAX));
+
+        await putUser(env, {
+          ...u,
+          feedNextAt: nextAt2,
+          feedDelivered: trimmedDelivered,
+          feedRecentThreadIds: recent.slice(-FEED_RECENT_THREAD_MAX),
+          feedRecentReviewIds: trimmedRecentReviews
+        });
+        sent++;
+        continue;
+      }
+    }
+
+    // 2) Fallback: DonColombia feed events.
+    if (events.length === 0) {
+      await putUser(env, {
+        ...u,
+        feedNextAt: nextAt2,
+        feedDelivered: delivered.slice(-FEED_DELIVERED_MAX),
+        feedRecentThreadIds: recent.slice(-FEED_RECENT_THREAD_MAX),
+        feedRecentReviewIds: recentReviews.slice(-FEED_RECENT_REVIEW_MAX)
+      });
+      continue;
+    }
 
     let picked: FeedEvent | null = null;
     let isRepeat = false;
@@ -689,8 +867,9 @@ async function runUserFeedNotifications(env: Env, state: PollState, users: UserC
       if (e.kind === "seed") continue;
       if (!userWantsFeedEvent(u, e)) continue;
       if (!matchesUserFilters(u, e.thread)) continue;
-      const key = feedEventKey(e);
-      if (deliveredSet.has(key)) continue;
+      const keyBase = feedEventKey(e);
+      const key = `t:${keyBase}`;
+      if (deliveredSet.has(keyBase) || deliveredSet.has(key)) continue;
       if (recentSet.has(e.thread.id)) continue;
       picked = e;
       break;
@@ -702,8 +881,9 @@ async function runUserFeedNotifications(env: Env, state: PollState, users: UserC
         if (e.kind !== "seed") continue;
         if (!userWantsFeedEvent(u, e)) continue;
         if (!matchesUserFilters(u, e.thread)) continue;
-        const key = feedEventKey(e);
-        if (deliveredSet.has(key)) continue;
+        const keyBase = feedEventKey(e);
+        const key = `t:${keyBase}`;
+        if (deliveredSet.has(keyBase) || deliveredSet.has(key)) continue;
         if (recentSet.has(e.thread.id)) continue;
         picked = e;
         break;
@@ -739,23 +919,33 @@ async function runUserFeedNotifications(env: Env, state: PollState, users: UserC
       }
     }
 
-    const nextAt2 = scheduleNextFeedAt(now);
-
     if (!picked) {
       // Still nothing; just reschedule to avoid tight loops.
-      await putUser(env, { ...u, feedNextAt: nextAt2, feedDelivered: delivered.slice(-FEED_DELIVERED_MAX), feedRecentThreadIds: recent.slice(-FEED_RECENT_THREAD_MAX) });
+      await putUser(env, {
+        ...u,
+        feedNextAt: nextAt2,
+        feedDelivered: delivered.slice(-FEED_DELIVERED_MAX),
+        feedRecentThreadIds: recent.slice(-FEED_RECENT_THREAD_MAX),
+        feedRecentReviewIds: recentReviews.slice(-FEED_RECENT_REVIEW_MAX)
+      });
       continue;
     }
 
     await sendFeedThreadAlert(env, u.chatId, picked, { isRepeat });
 
-    const nextDelivered = [...delivered, feedEventKey(picked)];
+    const nextDelivered = [...delivered, `t:${feedEventKey(picked)}`];
     const trimmedDelivered = nextDelivered.slice(Math.max(0, nextDelivered.length - FEED_DELIVERED_MAX));
 
     const nextRecent = [...recent, picked.thread.id];
     const trimmedRecent = nextRecent.slice(Math.max(0, nextRecent.length - FEED_RECENT_THREAD_MAX));
 
-    await putUser(env, { ...u, feedNextAt: nextAt2, feedDelivered: trimmedDelivered, feedRecentThreadIds: trimmedRecent });
+    await putUser(env, {
+      ...u,
+      feedNextAt: nextAt2,
+      feedDelivered: trimmedDelivered,
+      feedRecentThreadIds: trimmedRecent,
+      feedRecentReviewIds: recentReviews.slice(-FEED_RECENT_REVIEW_MAX)
+    });
     sent++;
   }
 }
@@ -804,6 +994,28 @@ async function sendFeedThreadAlert(
 
   // Web preview ON (if the page has og:image, Telegram usually shows it).
   await tgSendMessage(env, chatId, text, false, keyboard);
+}
+
+async function sendFeedReviewAlert(
+  env: Env,
+  chatId: number,
+  it: ReviewIndexEntry,
+  opts: { isRepeat: boolean }
+): Promise<void> {
+  const label = opts.isRepeat ? "Pa que no se le pase" : "Resena";
+  const title = truncate(it.title || it.subjectName || it.id, 220);
+
+  const lines: string[] = [];
+  lines.push(`Pilas pues: ${label}`);
+  lines.push(`[${it.city}] ${title}`);
+  if (it.createdAt) lines.push(`Fecha: ${formatCoDateTimeFromSec(it.createdAt)}`);
+
+  const up = typeof it.votesUp === "number" ? it.votesUp : 0;
+  const down = typeof it.votesDown === "number" ? it.votesDown : 0;
+  const cc = typeof it.commentsCount === "number" ? it.commentsCount : 0;
+  if (up || down || cc) lines.push(`Votos: +${up} / -${down} | Opiniones: ${cc}`);
+
+  await tgSendMessage(env, chatId, lines.join("\n"), true, buildReviewInlineKeyboard(env, it.id));
 }
 
 function matchesUserFilters(u: UserConfig, t: ThreadItem): boolean {
@@ -867,9 +1079,23 @@ async function handleTelegramMessage(message: any, env: Env): Promise<void> {
 
   if (cmd && cmd.name === "cancel") {
     await deleteReviewDraft(env, chatId);
+    await deleteCommentDraft(env, chatId);
+    await deleteSearchDraft(env, chatId);
     const user = await ensureUser(env, chatId);
-    await tgSendMessage(env, chatId, "Listo, cancele esa resena.", true);
+    await tgSendMessage(env, chatId, "Listo, cancele eso.", true);
     await sendMainMenu(env, user, chatId, false);
+    return;
+  }
+
+  const searchDraft = await getSearchDraft(env, chatId);
+  if (searchDraft && !cmd) {
+    await handleSearchDraftText(env, chatId, searchDraft, text);
+    return;
+  }
+
+  const commentDraft = await getCommentDraft(env, chatId);
+  if (commentDraft && !cmd) {
+    await handleCommentDraftText(env, chatId, commentDraft, text);
     return;
   }
 
@@ -1155,155 +1381,204 @@ async function handleTelegramCallback(cb: any, env: Env): Promise<void> {
     return;
   }
 
-  if (data.startsWith("rvw:citypage:")) {
-    const page = parseInt(data.split(":")[2] ?? "0", 10);
-    if (messageId) await sendReviewCityPage(env, chatId, Number.isFinite(page) ? page : 0, true, messageId);
-    await tgAnswerCallback(env, cb.id, "");
-    return;
-  }
-
-  if (data === "rvw:latest") {
-    await tgAnswerCallback(env, cb.id, "Ya casi...");
-    await sendLatestReviews(env, user, chatId, 5);
-    return;
-  }
-
-  if (data === "rvw:new") {
-    if (messageId) await sendReviewCityPage(env, chatId, 0, true, messageId);
-    else await sendReviewCityPage(env, chatId, 0, false);
-    await tgAnswerCallback(env, cb.id, "");
-    return;
-  }
-
-  if (data.startsWith("rvw_city:")) {
+  if (data.startsWith("rvw:")) {
     const parts = data.split(":");
-    const cityId = parts[1] ?? "";
-    const page = parseInt(parts[2] ?? "0", 10);
-    const city = CITY_PRESETS.find((c) => c.id === cityId);
-    if (!city) {
+    const action = parts[1] ?? "";
+
+    if (action === "citypage") {
+      const page = parseInt(parts[2] ?? "0", 10);
+      if (messageId) await sendReviewCityPage(env, chatId, Number.isFinite(page) ? page : 0, true, messageId);
       await tgAnswerCallback(env, cb.id, "");
       return;
     }
 
-    await putReviewDraft(env, {
-      v: 1,
-      chatId,
-      createdAt: nowSec(),
-      updatedAt: nowSec(),
-      step: "await_title",
-      city: city.name,
-      tags: [city.name]
-    });
-
-    await tgAnswerCallback(env, cb.id, "Listo");
-    await tgSendMessage(
-      env,
-      chatId,
-      [
-        "Listo pues.",
-        `Ciudad: ${city.name}`,
-        "",
-        "Ahora mande un titulo corto (opcional).",
-        "Ej: 'Resena en Chapinero'",
-        "",
-        "Si no quiere, toque 'Saltar'."
-      ].join("\n"),
-      true,
-      { inline_keyboard: [[{ text: "Saltar", callback_data: "rvw:skip_title" }, { text: "Cancelar", callback_data: "rvw:cancel" }]] }
-    );
-
-    if (messageId) await sendReviewCityPage(env, chatId, Number.isFinite(page) ? page : 0, true, messageId);
-    return;
-  }
-
-  if (data === "rvw:skip_title") {
-    const draft = await getReviewDraft(env, chatId);
-    if (!draft) {
-      await tgAnswerCallback(env, cb.id, "Se vencio");
-      return;
-    }
-    const next: ReviewDraft = { ...draft, step: "await_desc", title: draft.title?.trim() || `Resena en ${draft.city}`, updatedAt: nowSec() };
-    await putReviewDraft(env, next);
-    await tgAnswerCallback(env, cb.id, "Dale");
-    await tgSendMessage(
-      env,
-      chatId,
-      [
-        `Titulo: ${next.title}`,
-        "",
-        "Ahora si: escriba la resena en sus palabras (1 mensaje).",
-        "Tip: sea directo, que la IA solo la organiza mejor."
-      ].join("\n"),
-      true,
-      { inline_keyboard: [[{ text: "Cancelar", callback_data: "rvw:cancel" }]] }
-    );
-    return;
-  }
-
-  if (data === "rvw:cancel") {
-    await deleteReviewDraft(env, chatId);
-    await tgAnswerCallback(env, cb.id, "Listo");
-    if (messageId) await sendReviewsMenu(env, user, chatId, true, messageId);
-    return;
-  }
-
-  if (data === "rvw:edit") {
-    const draft = await getReviewDraft(env, chatId);
-    if (!draft) {
-      await tgAnswerCallback(env, cb.id, "Se vencio");
-      return;
-    }
-    const next: ReviewDraft = { ...draft, step: "await_desc", updatedAt: nowSec() };
-    await putReviewDraft(env, next);
-    await tgAnswerCallback(env, cb.id, "Dale");
-    await tgSendMessage(env, chatId, "Listo, mande el texto otra vez (1 mensaje).", true, {
-      inline_keyboard: [[{ text: "Cancelar", callback_data: "rvw:cancel" }]]
-    });
-    return;
-  }
-
-  if (data === "rvw:publish") {
-    const draft = await getReviewDraft(env, chatId);
-    if (!draft || draft.step !== "confirm" || !draft.city || !draft.title || !draft.raw || !draft.story) {
-      await tgAnswerCallback(env, cb.id, "Se vencio");
+    if (action === "latest") {
+      await tgAnswerCallback(env, cb.id, "Ya casi...");
+      await sendLatestReviews(env, user, chatId, 8);
       return;
     }
 
-    const item: ReviewItem = {
-      v: 1,
-      id: randomTokenHex(8),
-      createdAt: nowSec(),
-      createdBy: chatId,
-      city: draft.city,
-      title: draft.title,
-      tags: draft.tags?.length ? draft.tags : [draft.city],
-      raw: draft.raw,
-      story: draft.story
-    };
+    if (action === "search") {
+      await putSearchDraft(env, { v: 1, chatId, createdAt: nowSec(), updatedAt: nowSec(), step: "await_query" });
+      await tgAnswerCallback(env, cb.id, "Listo");
+      await tgSendMessage(
+        env,
+        chatId,
+        ["Listo pues. Mande lo que tenga:", "- Nombre/apodo", "- Telefono", "- Link", "- ID de la resena", "", "Si se arrepintio: /cancel"].join("\n"),
+        true,
+        { inline_keyboard: [[{ text: "Cancelar", callback_data: "rvw:cancel" }]] }
+      );
+      return;
+    }
 
-    await saveReview(env, item);
-    await deleteReviewDraft(env, chatId);
-
-    await tgAnswerCallback(env, cb.id, "Publicada");
-    const base = publicBaseUrl(env);
-    const row = base
-      ? [{ text: "Abrir", url: `${base}/r/${item.id}` }, { text: "Leer", callback_data: `rvw_read:${item.id}` }]
-      : [{ text: "Leer", callback_data: `rvw_read:${item.id}` }];
-    await tgSendMessage(env, chatId, "Listo pues, ya quedo publicada.", true, { inline_keyboard: [row] });
-
-    await notifyUsersAboutReview(env, item);
-    return;
-  }
-
-  if (data.startsWith("rvw_read:")) {
-    const id = data.split(":")[1] ?? "";
-    if (!id) {
+    if (action === "new") {
+      if (messageId) await sendReviewCityPage(env, chatId, 0, true, messageId);
+      else await sendReviewCityPage(env, chatId, 0, false);
       await tgAnswerCallback(env, cb.id, "");
       return;
     }
-    await tgAnswerCallback(env, cb.id, "Leyendo...");
-    await sendReviewRead(env, chatId, id);
-    return;
+
+    if (action === "city") {
+      const cityId = parts[2] ?? "";
+      const page = parseInt(parts[3] ?? "0", 10);
+      const city = CITY_PRESETS.find((c) => c.id === cityId);
+      if (!city) {
+        await tgAnswerCallback(env, cb.id, "");
+        return;
+      }
+
+      const draft: ReviewDraft = {
+        v: 1,
+        chatId,
+        createdAt: nowSec(),
+        updatedAt: nowSec(),
+        step: "await_mode",
+        city: city.name,
+        tags: [city.name]
+      };
+      await putReviewDraft(env, draft);
+
+      await tgAnswerCallback(env, cb.id, "Listo");
+      await sendReviewDraftPrompt(env, chatId, draft);
+
+      if (messageId) await sendReviewCityPage(env, chatId, Number.isFinite(page) ? page : 0, true, messageId);
+      return;
+    }
+
+    if (action === "mode") {
+      const mode = parts[2] ?? "";
+      if (mode !== "quick" && mode !== "full") {
+        await tgAnswerCallback(env, cb.id, "");
+        return;
+      }
+      const draft = await getReviewDraft(env, chatId);
+      if (!draft) {
+        await tgAnswerCallback(env, cb.id, "Se vencio");
+        return;
+      }
+      const next: ReviewDraft = { ...draft, mode: mode as any, step: "await_name", updatedAt: nowSec() };
+      await putReviewDraft(env, next);
+      await tgAnswerCallback(env, cb.id, "Dale");
+      await sendReviewDraftPrompt(env, chatId, next);
+      return;
+    }
+
+    if (action === "set") {
+      const key = parts[2] ?? "";
+      const val = parts.slice(3).join(":");
+      const draft = await getReviewDraft(env, chatId);
+      if (!draft) {
+        await tgAnswerCallback(env, cb.id, "Se vencio");
+        return;
+      }
+      await tgAnswerCallback(env, cb.id, "");
+      await applyReviewDraftPick(env, chatId, draft, { key, val });
+      return;
+    }
+
+    if (action === "num") {
+      const key = parts[2] ?? "";
+      const n = parseInt(parts[3] ?? "", 10);
+      const draft = await getReviewDraft(env, chatId);
+      if (!draft) {
+        await tgAnswerCallback(env, cb.id, "Se vencio");
+        return;
+      }
+      if (!Number.isFinite(n)) {
+        await tgAnswerCallback(env, cb.id, "");
+        return;
+      }
+      await tgAnswerCallback(env, cb.id, "");
+      await applyReviewDraftNumber(env, chatId, draft, { key, n });
+      return;
+    }
+
+    if (action === "skip") {
+      const draft = await getReviewDraft(env, chatId);
+      if (!draft) {
+        await tgAnswerCallback(env, cb.id, "Se vencio");
+        return;
+      }
+      await tgAnswerCallback(env, cb.id, "");
+      await skipReviewDraftStep(env, chatId, draft);
+      return;
+    }
+
+    if (action === "publish") {
+      const draft = await getReviewDraft(env, chatId);
+      if (!draft || draft.step !== "confirm") {
+        await tgAnswerCallback(env, cb.id, "Se vencio");
+        return;
+      }
+      await tgAnswerCallback(env, cb.id, "Publicando...");
+      await publishReviewFromDraft(env, chatId, draft);
+      return;
+    }
+
+    if (action === "restart") {
+      await deleteReviewDraft(env, chatId);
+      await tgAnswerCallback(env, cb.id, "Listo");
+      if (messageId) await sendReviewCityPage(env, chatId, 0, true, messageId);
+      else await sendReviewCityPage(env, chatId, 0, false);
+      return;
+    }
+
+    if (action === "read") {
+      const id = parts[2] ?? "";
+      if (!id) {
+        await tgAnswerCallback(env, cb.id, "");
+        return;
+      }
+      await tgAnswerCallback(env, cb.id, "Leyendo...");
+      await sendReviewRead(env, chatId, id);
+      return;
+    }
+
+    if (action === "vote") {
+      const dir = parts[2] ?? "";
+      const id = parts[3] ?? "";
+      if ((dir !== "up" && dir !== "down") || !id) {
+        await tgAnswerCallback(env, cb.id, "");
+        return;
+      }
+      const out = await applyReviewVote(env, id, chatId, dir as any);
+      const label = out ? `Listo. Votos: +${out.votesUp} / -${out.votesDown}` : "Uy, no pude votar en esa resena.";
+      await tgAnswerCallback(env, cb.id, label);
+      return;
+    }
+
+    if (action === "comment") {
+      const id = parts[2] ?? "";
+      if (!id) {
+        await tgAnswerCallback(env, cb.id, "");
+        return;
+      }
+      const review = await getReview(env, id);
+      if (!review) {
+        await tgAnswerCallback(env, cb.id, "No la encontre");
+        return;
+      }
+      await putCommentDraft(env, { v: 1, chatId, createdAt: nowSec(), updatedAt: nowSec(), step: "await_text", reviewId: id });
+      await tgAnswerCallback(env, cb.id, "Dale");
+      await tgSendMessage(
+        env,
+        chatId,
+        ["Listo. Mande su opinion en 1 mensaje.", "", `Resena: [${review.city}] ${review.title}`, "", "Para cancelar: /cancel"].join("\n"),
+        true,
+        { inline_keyboard: [[{ text: "Cancelar", callback_data: "rvw:cancel" }]] }
+      );
+      return;
+    }
+
+    if (action === "cancel") {
+      await deleteReviewDraft(env, chatId);
+      await deleteCommentDraft(env, chatId);
+      await deleteSearchDraft(env, chatId);
+      await tgAnswerCallback(env, cb.id, "Listo");
+      if (messageId) await sendReviewsMenu(env, user, chatId, true, messageId);
+      else await sendReviewsMenu(env, user, chatId, false);
+      return;
+    }
   }
 
   if (data.startsWith("wiz:")) {
@@ -1702,18 +1977,20 @@ async function sendMainMenu(
   const selectedTopics = user.includeKeywords.length ? user.includeKeywords.slice(0, 3).join(", ") : "(ninguno)";
   const text = [
     "Quiubo, parce.",
-    "Que quiere mirar hoy?",
+    "Este bot es pa resenas: crear, buscar, votar y opinar.",
     "",
     `Ciudades/temas: ${selectedTopics}`,
     `Foros: ${user.forums.length}`,
     "",
-    "Pilas: escoja ciudad/foro y yo le mando cositas cada ratico."
+    "Tip: si no hay resenas nuevas, le mando cositas mas viejas o de DonColombia."
   ].join("\n");
 
   const keyboard: any[][] = [
+    [{ text: "Buscar resena", callback_data: "rvw:search" }],
+    [{ text: "Crear resena", callback_data: "rvw:new" }],
     [{ text: "Elegir ciudad", callback_data: "wiz:cities:0" }],
-    [{ text: "Elegir foros", callback_data: "wiz:forums:0" }],
-    [{ text: "Resenas", callback_data: "wiz:reviews" }]
+    [{ text: "DonColombia (foros)", callback_data: "wiz:forums:0" }],
+    [{ text: "Resenas (menu)", callback_data: "wiz:reviews" }]
   ];
 
   const base = publicBaseUrl(env);
@@ -1736,13 +2013,13 @@ async function sendHelpPage(env: Env, user: UserConfig, chatId: number, edit: bo
     "Ayuda (facil, sin enredos)",
     "",
     "1) Toque 'Elegir ciudad' y escoja su ciudad (o varias).",
-    "2) O toque 'Elegir foros' si quiere afinar mas.",
-    "3) Con eso ya queda prendido: le voy mandando cosas cada ratico.",
-    "4) Los avisos salen en tiempos aleatorios (entre 5 y 60 min).",
-    "5) En 'Resenas' puede ver y publicar resenas por ciudad.",
+    "2) Toque 'Buscar resena' o 'Crear resena' y siga los botones.",
+    "3) La gente puede votar (buena/mala) y opinar en cada resena.",
+    "4) Con filtros prendidos, le van llegando resenas cada ratico (entre 5 y 60 min).",
+    "5) Si no hay resenas nuevas, le mando resenas viejas o contenido de DonColombia (secundario).",
     "6) Si quiere apoyar el proyecto: toque 'Donar'.",
     "",
-    "Tip: si pega un link de un tema, el bot tambien le saca un extracto."
+    "Tip: si pega un link de DonColombia, el bot le saca un extracto."
   ].join("\n");
 
   const replyMarkup = { inline_keyboard: [[{ text: "Volver al menu", callback_data: "wiz:main" }]] };
@@ -2066,9 +2343,9 @@ function nowSec(): number {
 function bumpFeedAfterFilterChange(u: UserConfig): UserConfig {
   const now = nowSec();
   if (!hasPositiveFilters(u)) {
-    return { ...u, feedNextAt: 0, feedDelivered: [], feedRecentThreadIds: [] };
+    return { ...u, feedNextAt: 0, feedDelivered: [], feedRecentThreadIds: [], feedRecentReviewIds: [] };
   }
-  return { ...u, feedNextAt: scheduleFeedSoonAt(now), feedDelivered: [], feedRecentThreadIds: [] };
+  return { ...u, feedNextAt: scheduleFeedSoonAt(now), feedDelivered: [], feedRecentThreadIds: [], feedRecentReviewIds: [] };
 }
 
 async function ensureUser(env: Env, chatId: number): Promise<UserConfig> {
@@ -2104,7 +2381,8 @@ function createDefaultUser(chatId: number): UserConfig {
     notifyDonations: true,
     feedNextAt: 0,
     feedDelivered: [],
-    feedRecentThreadIds: []
+    feedRecentThreadIds: [],
+    feedRecentReviewIds: []
   };
 }
 
@@ -2122,6 +2400,9 @@ async function getUser(env: Env, chatId: number): Promise<UserConfig | null> {
   const feedRecentThreadIds: number[] = Array.isArray(raw.feedRecentThreadIds)
     ? raw.feedRecentThreadIds.map((x: any) => Number(x)).filter((n: number) => Number.isFinite(n))
     : [];
+  const feedRecentReviewIds: string[] = Array.isArray(raw.feedRecentReviewIds)
+    ? raw.feedRecentReviewIds.map((x: any) => String(x)).filter((s: string) => s)
+    : [];
 
   const u: UserConfig = {
     v: 1,
@@ -2138,7 +2419,8 @@ async function getUser(env: Env, chatId: number): Promise<UserConfig | null> {
     notifyDonations: typeof raw.notifyDonations === "boolean" ? raw.notifyDonations : true,
     feedNextAt: typeof raw.feedNextAt === "number" ? raw.feedNextAt : 0,
     feedDelivered: feedDelivered.slice(-FEED_DELIVERED_MAX),
-    feedRecentThreadIds: feedRecentThreadIds.slice(-FEED_RECENT_THREAD_MAX)
+    feedRecentThreadIds: feedRecentThreadIds.slice(-FEED_RECENT_THREAD_MAX),
+    feedRecentReviewIds: feedRecentReviewIds.slice(-FEED_RECENT_REVIEW_MAX)
   };
   return u;
 }
@@ -2762,10 +3044,19 @@ type ReviewIndexEntry = {
   createdAt: number;
   city: string;
   title: string;
+  subjectName?: string;
+  phone?: string;
+  contactLink?: string;
+  votesUp?: number;
+  votesDown?: number;
+  commentsCount?: number;
 };
 
 const REVIEW_DRAFT_TTL_SEC = 2 * 60 * 60;
 const REVIEW_INDEX_MAX = 400;
+const COMMENT_DRAFT_TTL_SEC = 45 * 60;
+const SEARCH_DRAFT_TTL_SEC = 25 * 60;
+const REVIEW_COMMENTS_INDEX_MAX = 80;
 
 function reviewKey(id: string): string {
   return `${REVIEW_KEY_PREFIX}${id}`;
@@ -2790,7 +3081,13 @@ async function getReviewIndex(env: Env): Promise<ReviewIndexEntry[]> {
         id,
         createdAt: typeof (it as any).createdAt === "number" ? (it as any).createdAt : 0,
         city: String((it as any).city ?? "").trim(),
-        title: String((it as any).title ?? "").trim()
+        title: String((it as any).title ?? "").trim(),
+        subjectName: String((it as any).subjectName ?? "").trim() || undefined,
+        phone: String((it as any).phone ?? "").trim() || undefined,
+        contactLink: String((it as any).contactLink ?? "").trim() || undefined,
+        votesUp: typeof (it as any).votesUp === "number" ? (it as any).votesUp : undefined,
+        votesDown: typeof (it as any).votesDown === "number" ? (it as any).votesDown : undefined,
+        commentsCount: typeof (it as any).commentsCount === "number" ? (it as any).commentsCount : undefined
       });
     }
     out.sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0));
@@ -2814,7 +3111,18 @@ async function getReview(env: Env, id: string): Promise<ReviewItem | null> {
 async function saveReview(env: Env, item: ReviewItem): Promise<void> {
   await env.KV.put(reviewKey(item.id), JSON.stringify(item));
   const idx = await getReviewIndex(env);
-  const entry: ReviewIndexEntry = { id: item.id, createdAt: item.createdAt, city: item.city, title: item.title };
+  const entry: ReviewIndexEntry = {
+    id: item.id,
+    createdAt: item.createdAt,
+    city: item.city,
+    title: item.title,
+    subjectName: item.subjectName,
+    phone: item.phone,
+    contactLink: item.contactLink,
+    votesUp: item.votesUp,
+    votesDown: item.votesDown,
+    commentsCount: item.commentsCount
+  };
   const next = [entry, ...idx.filter((e) => e.id !== item.id)];
   await putReviewIndex(env, next);
 }
@@ -2837,12 +3145,162 @@ async function deleteReviewDraft(env: Env, chatId: number): Promise<void> {
   await env.KV.delete(key).catch(() => undefined);
 }
 
+function commentDraftKey(chatId: number): string {
+  return `${COMMENT_DRAFT_KEY_PREFIX}${chatId}`;
+}
+
+function searchDraftKey(chatId: number): string {
+  return `${SEARCH_DRAFT_KEY_PREFIX}${chatId}`;
+}
+
+async function getSearchDraft(env: Env, chatId: number): Promise<SearchDraft | null> {
+  const key = searchDraftKey(chatId);
+  const draft = (await env.KV.get(key, { type: "json" }).catch(() => null)) as SearchDraft | null;
+  if (!draft || draft.v !== 1 || draft.chatId !== chatId) return null;
+  if (draft.step !== "await_query") return null;
+  return draft;
+}
+
+async function putSearchDraft(env: Env, draft: SearchDraft): Promise<void> {
+  const key = searchDraftKey(draft.chatId);
+  await env.KV.put(key, JSON.stringify(draft), { expirationTtl: SEARCH_DRAFT_TTL_SEC });
+}
+
+async function deleteSearchDraft(env: Env, chatId: number): Promise<void> {
+  const key = searchDraftKey(chatId);
+  await env.KV.delete(key).catch(() => undefined);
+}
+
+async function getCommentDraft(env: Env, chatId: number): Promise<CommentDraft | null> {
+  const key = commentDraftKey(chatId);
+  const draft = (await env.KV.get(key, { type: "json" }).catch(() => null)) as CommentDraft | null;
+  if (!draft || draft.v !== 1 || draft.chatId !== chatId) return null;
+  if (!draft.reviewId || draft.step !== "await_text") return null;
+  return draft;
+}
+
+async function putCommentDraft(env: Env, draft: CommentDraft): Promise<void> {
+  const key = commentDraftKey(draft.chatId);
+  await env.KV.put(key, JSON.stringify(draft), { expirationTtl: COMMENT_DRAFT_TTL_SEC });
+}
+
+async function deleteCommentDraft(env: Env, chatId: number): Promise<void> {
+  const key = commentDraftKey(chatId);
+  await env.KV.delete(key).catch(() => undefined);
+}
+
+type ReviewCommentIndexEntry = {
+  id: string;
+  createdAt: number;
+  createdBy: number;
+};
+
+type ReviewCommentItem = {
+  v: 1;
+  id: string;
+  reviewId: string;
+  createdAt: number;
+  createdBy: number;
+  text: string;
+};
+
+function reviewVoteKey(reviewId: string, chatId: number): string {
+  return `${REVIEW_VOTE_KEY_PREFIX}${reviewId}:${chatId}`;
+}
+
+function reviewCommentsIndexKey(reviewId: string): string {
+  return `${REVIEW_COMMENTS_INDEX_KEY_PREFIX}${reviewId}`;
+}
+
+function reviewCommentKey(reviewId: string, commentId: string): string {
+  return `${REVIEW_COMMENT_KEY_PREFIX}${reviewId}:${commentId}`;
+}
+
+async function getReviewCommentsIndex(env: Env, reviewId: string): Promise<ReviewCommentIndexEntry[]> {
+  const raw = await env.KV.get(reviewCommentsIndexKey(reviewId));
+  if (!raw) return [];
+  try {
+    const arr = JSON.parse(raw) as any[];
+    if (!Array.isArray(arr)) return [];
+    const out: ReviewCommentIndexEntry[] = [];
+    for (const it of arr) {
+      if (!it || typeof it !== "object") continue;
+      const id = String((it as any).id ?? "").trim();
+      if (!id) continue;
+      out.push({
+        id,
+        createdAt: typeof (it as any).createdAt === "number" ? (it as any).createdAt : 0,
+        createdBy: typeof (it as any).createdBy === "number" ? (it as any).createdBy : 0
+      });
+    }
+    out.sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0));
+    return out.slice(0, REVIEW_COMMENTS_INDEX_MAX);
+  } catch {
+    return [];
+  }
+}
+
+async function putReviewCommentsIndex(env: Env, reviewId: string, entries: ReviewCommentIndexEntry[]): Promise<void> {
+  await env.KV.put(reviewCommentsIndexKey(reviewId), JSON.stringify(entries.slice(0, REVIEW_COMMENTS_INDEX_MAX)));
+}
+
+async function saveReviewComment(env: Env, reviewId: string, createdBy: number, text: string): Promise<ReviewCommentItem | null> {
+  const review = await getReview(env, reviewId);
+  if (!review) return null;
+
+  const trimmed = clipText(String(text ?? "").trim(), 1400);
+  if (!trimmed) return null;
+
+  const id = randomTokenHex(8);
+  const item: ReviewCommentItem = {
+    v: 1,
+    id,
+    reviewId,
+    createdAt: nowSec(),
+    createdBy,
+    text: trimmed
+  };
+
+  await env.KV.put(reviewCommentKey(reviewId, id), JSON.stringify(item));
+
+  const idx = await getReviewCommentsIndex(env, reviewId);
+  const entry: ReviewCommentIndexEntry = { id, createdAt: item.createdAt, createdBy };
+  const next = [entry, ...idx.filter((e) => e.id !== id)];
+  await putReviewCommentsIndex(env, reviewId, next);
+
+  // Update counters (best-effort).
+  const nextCount = Math.max(0, Number(review.commentsCount ?? 0) + 1);
+  const updated: ReviewItem = { ...review, commentsCount: nextCount };
+  await saveReview(env, updated);
+
+  return item;
+}
+
+async function getReviewComment(env: Env, reviewId: string, commentId: string): Promise<ReviewCommentItem | null> {
+  const key = reviewCommentKey(reviewId, commentId);
+  const item = (await env.KV.get(key, { type: "json" }).catch(() => null)) as ReviewCommentItem | null;
+  if (!item || item.v !== 1 || item.reviewId !== reviewId) return null;
+  return item;
+}
+
+async function listLatestReviewComments(env: Env, reviewId: string, limit: number): Promise<ReviewCommentItem[]> {
+  const idx = await getReviewCommentsIndex(env, reviewId);
+  const slice = idx.slice(0, Math.max(0, Math.min(limit, REVIEW_COMMENTS_INDEX_MAX)));
+  const out: ReviewCommentItem[] = [];
+  for (const e of slice) {
+    const it = await getReviewComment(env, reviewId, e.id);
+    if (it) out.push(it);
+  }
+  out.sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0));
+  return out;
+}
+
 async function sendReviewsMenu(env: Env, user: UserConfig, chatId: number, edit: boolean, messageId?: number): Promise<void> {
   const selected = user.includeKeywords.length ? user.includeKeywords.slice(0, 4).join(", ") : "(ninguna)";
   const text = [
     "Resenas",
     "",
-    "Aca puede ver y publicar resenas filtradas por sus ciudades/temas.",
+    "Aca es donde esta lo bueno: buscar, publicar y ver resenas.",
     "",
     `Ciudades/temas: ${selected}`,
     "",
@@ -2851,7 +3309,8 @@ async function sendReviewsMenu(env: Env, user: UserConfig, chatId: number, edit:
 
   const replyMarkup = {
     inline_keyboard: [
-      [{ text: "Ultimas 5", callback_data: "rvw:latest" }],
+      [{ text: "Buscar resena", callback_data: "rvw:search" }],
+      [{ text: "Ultimas resenas", callback_data: "rvw:latest" }],
       [{ text: "Crear resena", callback_data: "rvw:new" }],
       [{ text: "Editar ciudades", callback_data: "wiz:cities:0" }],
       [{ text: "Volver al menu", callback_data: "wiz:main" }]
@@ -2870,7 +3329,7 @@ async function sendReviewCityPage(env: Env, chatId: number, page: number, edit: 
 
   const keyboard: any[][] = [];
   for (const c of slice) {
-    keyboard.push([{ text: c.name, callback_data: `rvw_city:${c.id}:${p}` }]);
+    keyboard.push([{ text: c.name, callback_data: `rvw:city:${c.id}:${p}` }]);
   }
 
   const navRow: any[] = [];
@@ -2886,6 +3345,679 @@ async function sendReviewCityPage(env: Env, chatId: number, page: number, edit: 
 
   if (edit && messageId) await tgEditMessage(env, chatId, messageId, text, replyMarkup);
   else await tgSendMessage(env, chatId, text, true, replyMarkup);
+}
+
+function reviewFlowSteps(mode: "quick" | "full"): ReviewDraft["step"][] {
+  const quick: ReviewDraft["step"][] = [
+    "await_name",
+    "pick_photos",
+    "pick_physical_score",
+    "pick_service_score",
+    "pick_service_time",
+    "await_rate",
+    "pick_place",
+    "await_comment",
+    "await_phone",
+    "await_contact_link",
+    "confirm"
+  ];
+
+  const full: ReviewDraft["step"][] = [
+    "await_name",
+    "await_age",
+    "pick_skin",
+    "await_height",
+    "pick_face",
+    "pick_breasts",
+    "pick_butt",
+    "pick_photos",
+    "pick_physical_score",
+    "pick_hygiene",
+    "pick_kisses",
+    "pick_oral_condition",
+    "pick_oral_quality",
+    "pick_anal_offer",
+    "pick_anal_quality",
+    "pick_service_score",
+    "pick_service_time",
+    "await_rate",
+    "pick_place",
+    "pick_pay_on_entry",
+    "pick_site_quality",
+    "await_comment",
+    "await_phone",
+    "await_contact_link",
+    "confirm"
+  ];
+
+  return mode === "full" ? full : quick;
+}
+
+function reviewTitleFromDraft(d: ReviewDraft): string {
+  const name = String(d.subjectName ?? "").trim();
+  if (name) return `${name} (${d.city})`;
+  return `Resena en ${d.city}`;
+}
+
+function buildReviewTagsFromDraft(d: ReviewDraft): string[] {
+  const tags: string[] = [];
+  if (d.city) tags.push(d.city);
+  const name = String(d.subjectName ?? "").trim();
+  if (name) tags.push(name);
+  return tags;
+}
+
+function normalizePhone(s: string): string {
+  const raw = String(s ?? "");
+  const digits = raw.replace(/[^0-9+]/g, "");
+  // Keep only one leading +
+  if (digits.startsWith("+")) return "+" + digits.slice(1).replace(/[^0-9]/g, "");
+  return digits.replace(/[^0-9]/g, "");
+}
+
+function parseAge(text: string): number | null {
+  const m = String(text ?? "").match(/\d{1,2}/);
+  if (!m) return null;
+  const n = parseInt(m[0], 10);
+  if (!Number.isFinite(n)) return null;
+  if (n < 18 || n > 70) return null;
+  return n;
+}
+
+function parseHeight(text: string): string | null {
+  const raw = String(text ?? "").trim().replace(",", ".");
+  if (!raw) return null;
+  // Accept "1.65" or "165"
+  const m = raw.match(/(\d{1,3})(?:\.(\d{1,2}))?/);
+  if (!m) return null;
+  const a = m[1] ?? "";
+  const b = m[2] ?? "";
+  if (a.length === 3 && !b) {
+    const cm = parseInt(a, 10);
+    if (!Number.isFinite(cm) || cm < 130 || cm > 200) return null;
+    const meters = (cm / 100).toFixed(2);
+    return meters;
+  }
+  const meters = b ? `${a}.${b}` : a;
+  const n = parseFloat(meters);
+  if (!Number.isFinite(n) || n < 1.3 || n > 2.0) return null;
+  return n.toFixed(2);
+}
+
+function parseCop(text: string): number | null {
+  const digits = String(text ?? "").replace(/[^0-9]/g, "");
+  if (!digits) return null;
+  const n = parseInt(digits, 10);
+  if (!Number.isFinite(n)) return null;
+  if (n < 1000) return null;
+  if (n > 50_000_000) return null;
+  return n;
+}
+
+function parseHttpUrl(text: string): string | null {
+  const s = String(text ?? "").trim();
+  if (!s) return null;
+  try {
+    const u = new URL(s);
+    if (u.protocol !== "http:" && u.protocol !== "https:") return null;
+    return u.toString();
+  } catch {
+    return null;
+  }
+}
+
+function computeFinalScore(physicalScore?: number, serviceScore?: number): number | undefined {
+  const a = typeof physicalScore === "number" && Number.isFinite(physicalScore) ? physicalScore : 0;
+  const b = typeof serviceScore === "number" && Number.isFinite(serviceScore) ? serviceScore : 0;
+  if (!a && !b) return undefined;
+  if (a && b) return Math.round(((a + b) / 2) * 10) / 10;
+  return a || b || undefined;
+}
+
+function formatReviewTemplateFromItem(item: ReviewItem): string {
+  const lines: string[] = [];
+
+  const pushLine = (label: string, value: any) => {
+    const v = String(value ?? "").trim();
+    if (!v) return;
+    lines.push(`- ${label}: ${v}`);
+  };
+
+  lines.push("Atributos Fisicos y Generales");
+  pushLine("Nombre/Apodo", item.subjectName);
+  pushLine("Edad", item.age ? `Aprox ${item.age} anos` : "");
+  pushLine("Color de piel", item.skinColor);
+  pushLine("Estatura", item.height ? `${item.height}` : "");
+  pushLine("Cara", item.face);
+  pushLine("Senos", item.breasts);
+  pushLine("Cola", item.butt);
+  pushLine("Es como las fotos", item.photosMatch);
+  pushLine("Calificacion del fisico", typeof item.physicalScore === "number" ? String(item.physicalScore) : "");
+
+  lines.push("");
+  lines.push("Atributos NO Fisicos");
+  pushLine("Aseo y bioseguridad", item.hygiene);
+  pushLine("Da besos", item.kisses);
+  pushLine("Condicion del oral", item.oralCondition);
+  pushLine("Calidad del oral", item.oralQuality);
+  pushLine("Ofrece anal", item.analOffer);
+  pushLine("Calidad del anal", item.analQuality);
+  pushLine("Calificacion del servicio", typeof item.serviceScore === "number" ? String(item.serviceScore) : "");
+
+  lines.push("");
+  lines.push("Otros Aspectos");
+  pushLine("Tiempo del servicio", item.serviceTime);
+  pushLine("Tarifa", typeof item.rateCop === "number" ? `${item.rateCop} COP` : "");
+  pushLine("En donde fue", item.place);
+  pushLine("Se paga al ingresar", item.payOnEntry);
+  pushLine("Calidad del sitio", item.siteQuality);
+  pushLine("Calificacion final", typeof item.finalScore === "number" ? String(item.finalScore) : "");
+
+  // For new reviews, `story` is an edited narrative. For older stored items, `story` may contain the full template,
+  // so we detect and ignore that legacy format.
+  const storyText = String(item.story ?? "").trim();
+  const commentText = String(item.comment ?? "").trim();
+  const rawText = String(item.raw ?? "").trim();
+  const looksLikeLegacyTemplate = (() => {
+    if (!storyText) return false;
+    const needles = ["Atributos Fisicos", "Atributos NO Fisicos", "Otros Aspectos", "Contactos"];
+    let hits = 0;
+    for (const n of needles) if (storyText.includes(n)) hits++;
+    return hits >= 2;
+  })();
+  const narrative = !looksLikeLegacyTemplate && storyText ? storyText : commentText || rawText;
+
+  if (narrative) {
+    lines.push("");
+    lines.push("Comentario general");
+    lines.push(narrative);
+  }
+
+  const phone = String(item.phone ?? "").trim();
+  const link = String(item.contactLink ?? "").trim();
+  if (phone || link) {
+    lines.push("");
+    lines.push("Contactos");
+    if (phone) pushLine("Telefono", phone);
+    if (link) pushLine("Link", link);
+  }
+
+  return lines.join("\n").trim();
+}
+
+function formatReviewTemplateFromDraft(draft: ReviewDraft): string {
+  const item: ReviewItem = {
+    v: 1,
+    id: "draft",
+    createdAt: draft.createdAt,
+    createdBy: draft.chatId,
+    city: draft.city,
+    title: draft.title || reviewTitleFromDraft(draft),
+    tags: draft.tags?.length ? draft.tags : buildReviewTagsFromDraft(draft),
+    raw: draft.raw || draft.comment || "",
+    story: draft.story || "",
+    subjectName: draft.subjectName,
+    age: draft.age,
+    skinColor: draft.skinColor,
+    height: draft.height,
+    face: draft.face,
+    breasts: draft.breasts,
+    butt: draft.butt,
+    photosMatch: draft.photosMatch,
+    physicalScore: draft.physicalScore,
+    hygiene: draft.hygiene,
+    kisses: draft.kisses,
+    oralCondition: draft.oralCondition,
+    oralQuality: draft.oralQuality,
+    analOffer: draft.analOffer,
+    analQuality: draft.analQuality,
+    serviceScore: draft.serviceScore,
+    serviceTime: draft.serviceTime,
+    rateCop: draft.rateCop,
+    place: draft.place,
+    payOnEntry: draft.payOnEntry,
+    siteQuality: draft.siteQuality,
+    finalScore: computeFinalScore(draft.physicalScore, draft.serviceScore),
+    comment: draft.comment,
+    phone: draft.phone,
+    contactLink: draft.contactLink
+  };
+  return formatReviewTemplateFromItem(item);
+}
+
+function buildReviewInlineKeyboard(env: Env, reviewId: string): any {
+  const base = publicBaseUrl(env);
+  const row1 = base
+    ? [{ text: "Abrir", url: `${base}/r/${reviewId}` }, { text: "Leer", callback_data: `rvw:read:${reviewId}` }]
+    : [{ text: "Leer", callback_data: `rvw:read:${reviewId}` }];
+  const row2 = [
+    { text: "Buena (+)", callback_data: `rvw:vote:up:${reviewId}` },
+    { text: "Mala (-)", callback_data: `rvw:vote:down:${reviewId}` }
+  ];
+  const row3 = [{ text: "Opinar", callback_data: `rvw:comment:${reviewId}` }];
+  return { inline_keyboard: [row1, row2, row3] };
+}
+
+async function sendReviewDraftPrompt(env: Env, chatId: number, draft: ReviewDraft): Promise<void> {
+  const header = [`Ciudad: ${draft.city}`, `Modo: ${draft.mode === "full" ? "Completa" : draft.mode === "quick" ? "Rapida" : "(sin elegir)"}`].join("\n");
+
+  if (draft.step === "await_mode") {
+    await tgSendMessage(env, chatId, [header, "", "Quiere hacer resena rapida o completa?"].join("\n"), true, {
+      inline_keyboard: [
+        [{ text: "Rapida (recomendada)", callback_data: "rvw:mode:quick" }],
+        [{ text: "Completa (plantilla)", callback_data: "rvw:mode:full" }],
+        [{ text: "Cancelar", callback_data: "rvw:cancel" }]
+      ]
+    });
+    return;
+  }
+
+  if (draft.step === "await_name") {
+    await tgSendMessage(env, chatId, [header, "", "Mande el nombre/apodo (1 mensaje).", "Ej: Luna"].join("\n"), true, {
+      inline_keyboard: [[{ text: "Saltar", callback_data: "rvw:skip" }, { text: "Cancelar", callback_data: "rvw:cancel" }]]
+    });
+    return;
+  }
+
+  if (draft.step === "await_age") {
+    await tgSendMessage(env, chatId, [header, "", "Edad aproximada? (solo numero)", "Ej: 23"].join("\n"), true, {
+      inline_keyboard: [[{ text: "Saltar", callback_data: "rvw:skip" }, { text: "Cancelar", callback_data: "rvw:cancel" }]]
+    });
+    return;
+  }
+
+  if (draft.step === "pick_skin") {
+    await tgSendMessage(env, chatId, [header, "", "Color de piel?"].join("\n"), true, {
+      inline_keyboard: [
+        [{ text: "Blanca", callback_data: "rvw:set:skin:Blanca" }, { text: "Morena", callback_data: "rvw:set:skin:Morena" }],
+        [{ text: "Triguena", callback_data: "rvw:set:skin:Triguena" }, { text: "Negra", callback_data: "rvw:set:skin:Negra" }],
+        [{ text: "Saltar", callback_data: "rvw:skip" }, { text: "Cancelar", callback_data: "rvw:cancel" }]
+      ]
+    });
+    return;
+  }
+
+  if (draft.step === "await_height") {
+    await tgSendMessage(env, chatId, [header, "", "Estatura? (ej: 1.65 o 165)"].join("\n"), true, {
+      inline_keyboard: [[{ text: "Saltar", callback_data: "rvw:skip" }, { text: "Cancelar", callback_data: "rvw:cancel" }]]
+    });
+    return;
+  }
+
+  if (draft.step === "pick_face") {
+    await tgSendMessage(env, chatId, [header, "", "Cara?"].join("\n"), true, {
+      inline_keyboard: [
+        [
+          { text: "Bonita", callback_data: "rvw:set:face:Bonita" },
+          { text: "Regular", callback_data: "rvw:set:face:Regular" },
+          { text: "Fea", callback_data: "rvw:set:face:Fea" }
+        ],
+        [{ text: "Saltar", callback_data: "rvw:skip" }, { text: "Cancelar", callback_data: "rvw:cancel" }]
+      ]
+    });
+    return;
+  }
+
+  if (draft.step === "pick_breasts") {
+    await tgSendMessage(env, chatId, [header, "", "Senos?"].join("\n"), true, {
+      inline_keyboard: [
+        [
+          { text: "Pequenos", callback_data: "rvw:set:breasts:Pequenos" },
+          { text: "Grandes", callback_data: "rvw:set:breasts:Grandes" }
+        ],
+        [
+          { text: "Operados", callback_data: "rvw:set:breasts:Operados" },
+          { text: "Naturales", callback_data: "rvw:set:breasts:Naturales" }
+        ],
+        [{ text: "Saltar", callback_data: "rvw:skip" }, { text: "Cancelar", callback_data: "rvw:cancel" }]
+      ]
+    });
+    return;
+  }
+
+  if (draft.step === "pick_butt") {
+    await tgSendMessage(env, chatId, [header, "", "Cola?"].join("\n"), true, {
+      inline_keyboard: [
+        [
+          { text: "Redonda", callback_data: "rvw:set:butt:Redonda" },
+          { text: "Plana", callback_data: "rvw:set:butt:Plana" }
+        ],
+        [
+          { text: "Operada", callback_data: "rvw:set:butt:Operada" },
+          { text: "Natural", callback_data: "rvw:set:butt:Natural" }
+        ],
+        [{ text: "Saltar", callback_data: "rvw:skip" }, { text: "Cancelar", callback_data: "rvw:cancel" }]
+      ]
+    });
+    return;
+  }
+
+  if (draft.step === "pick_photos") {
+    await tgSendMessage(env, chatId, [header, "", "Es como las fotos?"].join("\n"), true, {
+      inline_keyboard: [
+        [{ text: "Si", callback_data: "rvw:set:photos:Si" }, { text: "No", callback_data: "rvw:set:photos:No" }],
+        [{ text: "Saltar", callback_data: "rvw:skip" }, { text: "Cancelar", callback_data: "rvw:cancel" }]
+      ]
+    });
+    return;
+  }
+
+  if (draft.step === "pick_physical_score") {
+    const row1 = [1, 2, 3, 4, 5].map((n) => ({ text: String(n), callback_data: `rvw:num:physical:${n}` }));
+    const row2 = [6, 7, 8, 9, 10].map((n) => ({ text: String(n), callback_data: `rvw:num:physical:${n}` }));
+    await tgSendMessage(env, chatId, [header, "", "Calificacion del fisico (1-10)?"].join("\n"), true, {
+      inline_keyboard: [row1, row2, [{ text: "Saltar", callback_data: "rvw:skip" }, { text: "Cancelar", callback_data: "rvw:cancel" }]]
+    });
+    return;
+  }
+
+  if (draft.step === "pick_hygiene") {
+    await tgSendMessage(env, chatId, [header, "", "Aseo y bioseguridad?"].join("\n"), true, {
+      inline_keyboard: [
+        [{ text: "Aseada", callback_data: "rvw:set:hyg:Aseada" }, { text: "Desarreglada", callback_data: "rvw:set:hyg:Desarreglada" }],
+        [{ text: "Saltar", callback_data: "rvw:skip" }, { text: "Cancelar", callback_data: "rvw:cancel" }]
+      ]
+    });
+    return;
+  }
+
+  if (draft.step === "pick_kisses") {
+    await tgSendMessage(env, chatId, [header, "", "Da besos?"].join("\n"), true, {
+      inline_keyboard: [
+        [{ text: "Si", callback_data: "rvw:set:kisses:Si" }, { text: "No", callback_data: "rvw:set:kisses:No" }],
+        [{ text: "Con lengua", callback_data: "rvw:set:kisses:Con lengua" }, { text: "Solo picos", callback_data: "rvw:set:kisses:Solo picos" }],
+        [{ text: "Saltar", callback_data: "rvw:skip" }, { text: "Cancelar", callback_data: "rvw:cancel" }]
+      ]
+    });
+    return;
+  }
+
+  if (draft.step === "pick_oral_condition") {
+    await tgSendMessage(env, chatId, [header, "", "Condicion del oral?"].join("\n"), true, {
+      inline_keyboard: [
+        [{ text: "Preservativo", callback_data: "rvw:set:oralcond:Preservativo" }, { text: "Natural", callback_data: "rvw:set:oralcond:Natural" }],
+        [{ text: "Saltar", callback_data: "rvw:skip" }, { text: "Cancelar", callback_data: "rvw:cancel" }]
+      ]
+    });
+    return;
+  }
+
+  if (draft.step === "pick_oral_quality") {
+    await tgSendMessage(env, chatId, [header, "", "Calidad del oral?"].join("\n"), true, {
+      inline_keyboard: [
+        [{ text: "Bueno", callback_data: "rvw:set:oralq:Bueno" }, { text: "Regular", callback_data: "rvw:set:oralq:Regular" }, { text: "Malo", callback_data: "rvw:set:oralq:Malo" }],
+        [{ text: "Saltar", callback_data: "rvw:skip" }, { text: "Cancelar", callback_data: "rvw:cancel" }]
+      ]
+    });
+    return;
+  }
+
+  if (draft.step === "pick_anal_offer") {
+    await tgSendMessage(env, chatId, [header, "", "Ofrece anal?"].join("\n"), true, {
+      inline_keyboard: [
+        [{ text: "Si", callback_data: "rvw:set:anal:Si" }, { text: "No", callback_data: "rvw:set:anal:No" }, { text: "Adicional", callback_data: "rvw:set:anal:Adicional" }],
+        [{ text: "Saltar", callback_data: "rvw:skip" }, { text: "Cancelar", callback_data: "rvw:cancel" }]
+      ]
+    });
+    return;
+  }
+
+  if (draft.step === "pick_anal_quality") {
+    await tgSendMessage(env, chatId, [header, "", "Calidad del anal?"].join("\n"), true, {
+      inline_keyboard: [
+        [{ text: "Bueno", callback_data: "rvw:set:analq:Bueno" }, { text: "Regular", callback_data: "rvw:set:analq:Regular" }, { text: "Malo", callback_data: "rvw:set:analq:Malo" }],
+        [{ text: "Saltar", callback_data: "rvw:skip" }, { text: "Cancelar", callback_data: "rvw:cancel" }]
+      ]
+    });
+    return;
+  }
+
+  if (draft.step === "pick_service_score") {
+    const row1 = [1, 2, 3, 4, 5].map((n) => ({ text: String(n), callback_data: `rvw:num:service:${n}` }));
+    const row2 = [6, 7, 8, 9, 10].map((n) => ({ text: String(n), callback_data: `rvw:num:service:${n}` }));
+    await tgSendMessage(env, chatId, [header, "", "Calificacion del servicio (1-10)?"].join("\n"), true, {
+      inline_keyboard: [row1, row2, [{ text: "Saltar", callback_data: "rvw:skip" }, { text: "Cancelar", callback_data: "rvw:cancel" }]]
+    });
+    return;
+  }
+
+  if (draft.step === "pick_service_time") {
+    await tgSendMessage(env, chatId, [header, "", "Tiempo del servicio?"].join("\n"), true, {
+      inline_keyboard: [
+        [{ text: "Rato", callback_data: "rvw:set:time:Rato" }, { text: "1/2 hora", callback_data: "rvw:set:time:1/2 Hora" }],
+        [{ text: "1 hora", callback_data: "rvw:set:time:1 Hora" }, { text: "Otro", callback_data: "rvw:set:time:Otro" }],
+        [{ text: "Saltar", callback_data: "rvw:skip" }, { text: "Cancelar", callback_data: "rvw:cancel" }]
+      ]
+    });
+    return;
+  }
+
+  if (draft.step === "await_rate") {
+    await tgSendMessage(env, chatId, [header, "", "Tarifa? (solo numero, COP)", "Ej: 150000"].join("\n"), true, {
+      inline_keyboard: [[{ text: "Saltar", callback_data: "rvw:skip" }, { text: "Cancelar", callback_data: "rvw:cancel" }]]
+    });
+    return;
+  }
+
+  if (draft.step === "pick_place") {
+    await tgSendMessage(env, chatId, [header, "", "En donde fue el servicio?"].join("\n"), true, {
+      inline_keyboard: [
+        [{ text: "Hotel", callback_data: "rvw:set:place:Hotel" }, { text: "Motel", callback_data: "rvw:set:place:Motel" }],
+        [{ text: "Apartamento", callback_data: "rvw:set:place:Apartamento" }, { text: "Domicilio", callback_data: "rvw:set:place:Domicilio" }],
+        [{ text: "Otro", callback_data: "rvw:set:place:Otro" }, { text: "Saltar", callback_data: "rvw:skip" }],
+        [{ text: "Cancelar", callback_data: "rvw:cancel" }]
+      ]
+    });
+    return;
+  }
+
+  if (draft.step === "pick_pay_on_entry") {
+    await tgSendMessage(env, chatId, [header, "", "Se paga al ingresar?"].join("\n"), true, {
+      inline_keyboard: [
+        [{ text: "Si", callback_data: "rvw:set:pay:Si" }, { text: "No", callback_data: "rvw:set:pay:No" }],
+        [{ text: "Saltar", callback_data: "rvw:skip" }, { text: "Cancelar", callback_data: "rvw:cancel" }]
+      ]
+    });
+    return;
+  }
+
+  if (draft.step === "pick_site_quality") {
+    await tgSendMessage(env, chatId, [header, "", "Calidad del sitio?"].join("\n"), true, {
+      inline_keyboard: [
+        [{ text: "Bueno", callback_data: "rvw:set:site:Bueno" }, { text: "Regular", callback_data: "rvw:set:site:Regular" }, { text: "Malo", callback_data: "rvw:set:site:Malo" }],
+        [{ text: "Saltar", callback_data: "rvw:skip" }, { text: "Cancelar", callback_data: "rvw:cancel" }]
+      ]
+    });
+    return;
+  }
+
+  if (draft.step === "await_comment") {
+    await tgSendMessage(env, chatId, [header, "", "Comentario general (en sus palabras).", "Tip: 1 mensaje, sin pena."].join("\n"), true, {
+      inline_keyboard: [[{ text: "Saltar", callback_data: "rvw:skip" }, { text: "Cancelar", callback_data: "rvw:cancel" }]]
+    });
+    return;
+  }
+
+  if (draft.step === "await_phone") {
+    await tgSendMessage(env, chatId, [header, "", "Telefono (opcional).", "Ej: 3001234567"].join("\n"), true, {
+      inline_keyboard: [[{ text: "Saltar", callback_data: "rvw:skip" }, { text: "Cancelar", callback_data: "rvw:cancel" }]]
+    });
+    return;
+  }
+
+  if (draft.step === "await_contact_link") {
+    await tgSendMessage(env, chatId, [header, "", "Link web/contacto (opcional).", "Ej: https://..."].join("\n"), true, {
+      inline_keyboard: [[{ text: "Saltar", callback_data: "rvw:skip" }, { text: "Cancelar", callback_data: "rvw:cancel" }]]
+    });
+    return;
+  }
+
+  if (draft.step === "confirm") {
+    const preview = formatReviewTemplateFromDraft(draft);
+    await tgSendMessage(env, chatId, ["Asi va quedando:", "", truncate(preview, 3200), "", "Si esta bien, publique."].join("\n"), true, {
+      inline_keyboard: [[
+        { text: "Publicar", callback_data: "rvw:publish" },
+        { text: "Empezar de nuevo", callback_data: "rvw:restart" },
+        { text: "Cancelar", callback_data: "rvw:cancel" }
+      ]]
+    });
+    return;
+  }
+
+  await tgSendMessage(env, chatId, "Toque un boton o /cancel.", true, { inline_keyboard: [[{ text: "Cancelar", callback_data: "rvw:cancel" }]] });
+}
+
+function nextDraftStep(draft: ReviewDraft): ReviewDraft["step"] {
+  const mode = draft.mode === "full" ? "full" : "quick";
+  const flow = reviewFlowSteps(mode);
+  const idx = flow.indexOf(draft.step);
+  if (idx === -1) return "confirm";
+  const next = flow[idx + 1];
+  return next ?? "confirm";
+}
+
+async function advanceReviewDraft(env: Env, chatId: number, draft: ReviewDraft): Promise<void> {
+  const next: ReviewDraft = { ...draft, step: nextDraftStep(draft), updatedAt: nowSec() };
+  next.title = reviewTitleFromDraft(next);
+  next.tags = buildReviewTagsFromDraft(next);
+
+  // Best-effort: improve the free-text comment with DeepSeek right before confirmation,
+  // so the preview shows the final narrative.
+  if (next.step === "confirm") {
+    const apiKey = String(env.DEEPSEEK_API_KEY ?? "").trim();
+    const raw = String(next.raw ?? next.comment ?? "").trim();
+    const hasStory = String(next.story ?? "").trim();
+    if (apiKey && raw && !hasStory) {
+      const improved = await improveReviewWithDeepSeek(env, { city: next.city, title: next.title || "", raw });
+      const story = clipText(String(improved ?? "").trim(), 2000);
+      if (story) next.story = story;
+    }
+  }
+
+  await putReviewDraft(env, next);
+  await sendReviewDraftPrompt(env, chatId, next);
+}
+
+async function skipReviewDraftStep(env: Env, chatId: number, draft: ReviewDraft): Promise<void> {
+  await advanceReviewDraft(env, chatId, draft);
+}
+
+async function applyReviewDraftPick(
+  env: Env,
+  chatId: number,
+  draft: ReviewDraft,
+  input: { key: string; val: string }
+): Promise<void> {
+  const key = String(input.key ?? "");
+  const val = String(input.val ?? "").trim();
+  if (!val) {
+    await sendReviewDraftPrompt(env, chatId, draft);
+    return;
+  }
+
+  const next: ReviewDraft = { ...draft, updatedAt: nowSec() };
+  if (key === "skin") next.skinColor = val;
+  else if (key === "face") next.face = val;
+  else if (key === "breasts") next.breasts = val;
+  else if (key === "butt") next.butt = val;
+  else if (key === "photos") next.photosMatch = val;
+  else if (key === "hyg") next.hygiene = val;
+  else if (key === "kisses") next.kisses = val;
+  else if (key === "oralcond") next.oralCondition = val;
+  else if (key === "oralq") next.oralQuality = val;
+  else if (key === "anal") next.analOffer = val;
+  else if (key === "analq") next.analQuality = val;
+  else if (key === "time") next.serviceTime = val;
+  else if (key === "place") next.place = val;
+  else if (key === "pay") next.payOnEntry = val;
+  else if (key === "site") next.siteQuality = val;
+
+  next.step = nextDraftStep(next);
+  next.title = reviewTitleFromDraft(next);
+  next.tags = buildReviewTagsFromDraft(next);
+  await putReviewDraft(env, next);
+  await sendReviewDraftPrompt(env, chatId, next);
+}
+
+async function applyReviewDraftNumber(
+  env: Env,
+  chatId: number,
+  draft: ReviewDraft,
+  input: { key: string; n: number }
+): Promise<void> {
+  const key = String(input.key ?? "");
+  const n = Math.floor(Number(input.n ?? 0));
+  if (!Number.isFinite(n)) {
+    await sendReviewDraftPrompt(env, chatId, draft);
+    return;
+  }
+  if (n < 1 || n > 10) {
+    await sendReviewDraftPrompt(env, chatId, draft);
+    return;
+  }
+
+  const next: ReviewDraft = { ...draft, updatedAt: nowSec() };
+  if (key === "physical") next.physicalScore = n;
+  else if (key === "service") next.serviceScore = n;
+
+  next.step = nextDraftStep(next);
+  next.title = reviewTitleFromDraft(next);
+  next.tags = buildReviewTagsFromDraft(next);
+  await putReviewDraft(env, next);
+  await sendReviewDraftPrompt(env, chatId, next);
+}
+
+async function publishReviewFromDraft(env: Env, chatId: number, draft: ReviewDraft): Promise<void> {
+  const title = reviewTitleFromDraft(draft);
+  const tags = buildReviewTagsFromDraft(draft);
+  const raw = String(draft.comment ?? draft.raw ?? "").trim();
+  const story = clipText(String(draft.story ?? "").trim(), 2000);
+
+  const item: ReviewItem = {
+    v: 1,
+    id: randomTokenHex(8),
+    createdAt: nowSec(),
+    createdBy: chatId,
+    city: draft.city,
+    title,
+    tags,
+    raw: raw,
+    story: story,
+    subjectName: draft.subjectName,
+    age: draft.age,
+    skinColor: draft.skinColor,
+    height: draft.height,
+    face: draft.face,
+    breasts: draft.breasts,
+    butt: draft.butt,
+    photosMatch: draft.photosMatch,
+    physicalScore: draft.physicalScore,
+    hygiene: draft.hygiene,
+    kisses: draft.kisses,
+    oralCondition: draft.oralCondition,
+    oralQuality: draft.oralQuality,
+    analOffer: draft.analOffer,
+    analQuality: draft.analQuality,
+    serviceScore: draft.serviceScore,
+    serviceTime: draft.serviceTime,
+    rateCop: draft.rateCop,
+    place: draft.place,
+    payOnEntry: draft.payOnEntry,
+    siteQuality: draft.siteQuality,
+    finalScore: computeFinalScore(draft.physicalScore, draft.serviceScore),
+    comment: draft.comment,
+    phone: draft.phone,
+    contactLink: draft.contactLink,
+    votesUp: 0,
+    votesDown: 0,
+    commentsCount: 0
+  };
+
+  await saveReview(env, item);
+  await deleteReviewDraft(env, chatId);
+
+  await tgSendMessage(env, chatId, "Listo pues, resena publicada.", true, buildReviewInlineKeyboard(env, item.id));
+  await notifyUsersAboutReview(env, item);
 }
 
 async function sendLatestReviews(env: Env, user: UserConfig, chatId: number, limit: number): Promise<void> {
@@ -2910,20 +4042,22 @@ async function sendLatestReviews(env: Env, user: UserConfig, chatId: number, lim
   for (let i = 0; i < items.length; i++) {
     const it = items[i];
     const text = formatLatestReviewItemText(it, i + 1, items.length);
-    const row = base
-      ? [{ text: "Abrir", url: `${base}/r/${it.id}` }, { text: "Leer", callback_data: `rvw_read:${it.id}` }]
-      : [{ text: "Leer", callback_data: `rvw_read:${it.id}` }];
-    await tgSendMessage(env, chatId, text, true, { inline_keyboard: [row] });
+    const keyboard = buildReviewInlineKeyboard(env, it.id);
+    await tgSendMessage(env, chatId, text, true, keyboard);
   }
 }
 
 function formatLatestReviewItemText(it: ReviewIndexEntry, idx: number, total: number): string {
   const lines: string[] = [];
   lines.push(`Pilas pues resenas (${idx}/${total})`);
-  lines.push(`[${it.city}] ${truncate(it.title || it.id, 180)}`);
+  lines.push(`[${it.city}] ${truncate(it.title || it.subjectName || it.id, 180)}`);
   if (it.createdAt) {
     lines.push(`Fecha: ${formatCoDateTimeFromSec(it.createdAt)}`);
   }
+  const up = typeof it.votesUp === "number" ? it.votesUp : 0;
+  const down = typeof it.votesDown === "number" ? it.votesDown : 0;
+  const cc = typeof it.commentsCount === "number" ? it.commentsCount : 0;
+  if (up || down || cc) lines.push(`Votos: +${up} / -${down} | Opiniones: ${cc}`);
   return lines.join("\n");
 }
 
@@ -2934,23 +4068,168 @@ async function sendReviewRead(env: Env, chatId: number, id: string): Promise<voi
     return;
   }
 
-  const base = publicBaseUrl(env);
+  const votesUp = Number(item.votesUp ?? 0);
+  const votesDown = Number(item.votesDown ?? 0);
+  const commentsCount = Number(item.commentsCount ?? 0);
+
   const lines: string[] = [];
   lines.push(item.title);
   lines.push(`Ciudad: ${item.city}`);
   lines.push(`Fecha: ${formatCoDateTimeFromSec(item.createdAt)}`);
+  lines.push(`Votos: +${votesUp} / -${votesDown} | Opiniones: ${commentsCount}`);
   lines.push("");
-  lines.push(item.story || item.raw || "(sin texto)");
-  if (base) {
+  lines.push(formatReviewTemplateFromItem(item));
+
+  const comments = await listLatestReviewComments(env, item.id, 5);
+  if (comments.length > 0) {
     lines.push("");
-    lines.push(`${base}/r/${item.id}`);
+    lines.push("Opiniones (ultimas):");
+    for (const c of comments) {
+      lines.push(`- ${formatCoDateTimeFromSec(c.createdAt)}: ${truncate(c.text, 260)}`);
+    }
   }
 
   await tgSendLongMessage(env, chatId, lines.join("\n"), true);
+  await tgSendMessage(env, chatId, "Quiere votar u opinar?", true, buildReviewInlineKeyboard(env, item.id));
+}
+
+async function applyReviewVote(
+  env: Env,
+  reviewId: string,
+  chatId: number,
+  dir: "up" | "down"
+): Promise<{ votesUp: number; votesDown: number } | null> {
+  const review = await getReview(env, reviewId);
+  if (!review) return null;
+
+  const key = reviewVoteKey(reviewId, chatId);
+  const prev = String((await env.KV.get(key).catch(() => "")) ?? "").trim();
+
+  let deltaUp = 0;
+  let deltaDown = 0;
+
+  if (prev === dir) {
+    // Toggle off
+    await env.KV.delete(key).catch(() => undefined);
+    if (dir === "up") deltaUp -= 1;
+    else deltaDown -= 1;
+  } else if (prev === "up" || prev === "down") {
+    await env.KV.put(key, dir);
+    if (prev === "up") deltaUp -= 1;
+    if (prev === "down") deltaDown -= 1;
+    if (dir === "up") deltaUp += 1;
+    if (dir === "down") deltaDown += 1;
+  } else {
+    await env.KV.put(key, dir);
+    if (dir === "up") deltaUp += 1;
+    else deltaDown += 1;
+  }
+
+  const votesUp = Math.max(0, Number(review.votesUp ?? 0) + deltaUp);
+  const votesDown = Math.max(0, Number(review.votesDown ?? 0) + deltaDown);
+
+  const updated: ReviewItem = { ...review, votesUp, votesDown };
+  await saveReview(env, updated);
+
+  return { votesUp, votesDown };
+}
+
+async function handleCommentDraftText(env: Env, chatId: number, draft: CommentDraft, textRaw: string): Promise<void> {
+  const text = String(textRaw ?? "").trim();
+  if (!text) {
+    await tgSendMessage(env, chatId, "Parce, mande un texto.", true);
+    return;
+  }
+
+  const item = await saveReviewComment(env, draft.reviewId, chatId, text);
+  await deleteCommentDraft(env, chatId);
+
+  if (!item) {
+    await tgSendMessage(env, chatId, "Uy, no pude guardar esa opinion. Intente otra vez.", true);
+    return;
+  }
+
+  await tgSendMessage(env, chatId, "Listo, opinion guardada.", true, buildReviewInlineKeyboard(env, draft.reviewId));
+
+  const review = await getReview(env, draft.reviewId);
+  if (review && review.createdBy && review.createdBy !== chatId) {
+    const snippet = truncate(item.text, 240);
+    await tgSendMessage(
+      env,
+      review.createdBy,
+      `Pilas: le dejaron una opinion en su resena\n[${review.city}] ${review.title}\n\n"${snippet}"`,
+      true,
+      buildReviewInlineKeyboard(env, review.id)
+    );
+  }
+}
+
+async function handleSearchDraftText(env: Env, chatId: number, draft: SearchDraft, textRaw: string): Promise<void> {
+  const q = String(textRaw ?? "").trim();
+  if (!q || q.length < 2) {
+    await tgSendMessage(env, chatId, "Mande mas info pues (nombre/telefono/link).", true);
+    return;
+  }
+
+  await deleteSearchDraft(env, chatId);
+
+  const url = extractFirstUrl(q) ?? (q.startsWith("http://") || q.startsWith("https://") ? q : "");
+  if (url) {
+    // Our review link: .../r/<id>
+    const m = String(url).match(/\/r\/([0-9a-fA-F]{6,40})/);
+    if (m?.[1]) {
+      const id = m[1].toLowerCase();
+      await sendReviewRead(env, chatId, id);
+      return;
+    }
+
+    // DonColombia thread/forum shortcut.
+    const threadInfo = threadPathInfoFromHref(url);
+    if (threadInfo) {
+      const canonUrl = new URL(threadInfo.basePath, env.SITE_BASE_URL).toString();
+      await handleReadCommand(env, chatId, canonUrl);
+      return;
+    }
+  }
+
+  // Raw id
+  if (/^[0-9a-fA-F]{16}$/.test(q)) {
+    await sendReviewRead(env, chatId, q.toLowerCase());
+    return;
+  }
+
+  const idx = await getReviewIndex(env);
+  const needleDigits = q.replace(/[^0-9]/g, "");
+  const needle = normalize(q);
+
+  let hits: ReviewIndexEntry[] = [];
+  if (needleDigits.length >= 7) {
+    hits = idx.filter((e) => String(e.phone ?? "").replace(/[^0-9]/g, "").includes(needleDigits));
+  } else {
+    hits = idx.filter((e) =>
+      normalize(`${e.city} ${e.title} ${e.subjectName ?? ""} ${e.phone ?? ""} ${e.contactLink ?? ""}`).includes(needle)
+    );
+  }
+
+  hits = hits.slice(0, 8);
+  if (hits.length === 0) {
+    await tgSendMessage(env, chatId, "Uy, no encontre resenas con eso. Pruebe con otro dato.", true, {
+      inline_keyboard: [[{ text: "Volver", callback_data: "wiz:reviews" }]]
+    });
+    return;
+  }
+
+  await tgSendMessage(env, chatId, `Listo, encontre ${hits.length}.`, true, { inline_keyboard: [[{ text: "Menu resenas", callback_data: "wiz:reviews" }]] });
+  for (let i = 0; i < hits.length; i++) {
+    const it = hits[i];
+    const text = formatLatestReviewItemText(it, i + 1, hits.length);
+    await tgSendMessage(env, chatId, text, true, buildReviewInlineKeyboard(env, it.id));
+  }
 }
 
 function matchesUserForReviewEntry(u: UserConfig, e: ReviewIndexEntry): boolean {
-  const text = normalize(`${e.city} ${e.title}`);
+  if (u.includeKeywords.length === 0) return false;
+  const text = normalize(`${e.city} ${e.title} ${e.subjectName ?? ""} ${e.phone ?? ""} ${e.contactLink ?? ""}`);
 
   for (const k of u.excludeKeywords) {
     if (!k) continue;
@@ -2972,64 +4251,94 @@ async function handleReviewDraftText(env: Env, chatId: number, draft: ReviewDraf
     return;
   }
 
-  if (draft.step === "await_title") {
-    const title = truncate(text, 120);
-    const next: ReviewDraft = { ...draft, title: title || `Resena en ${draft.city}`, step: "await_desc", updatedAt: nowSec() };
+  if (draft.step === "await_name") {
+    const name = truncate(text, 60);
+    const next: ReviewDraft = { ...draft, subjectName: name, updatedAt: nowSec() };
     await putReviewDraft(env, next);
-    await tgSendMessage(
-      env,
-      chatId,
-      [
-        `Titulo: ${next.title}`,
-        "",
-        "Ahora si: escriba la resena en sus palabras (1 mensaje).",
-        "Tip: sea directo, que yo la organizo.",
-        "",
-        "Si quiere cancelar: /cancel"
-      ].join("\n"),
-      true,
-      { inline_keyboard: [[{ text: "Cancelar", callback_data: "rvw:cancel" }]] }
-    );
+    await advanceReviewDraft(env, chatId, next);
     return;
   }
 
-  if (draft.step === "await_desc") {
-    const raw = clipText(text, 2000);
-    if (raw.length < 15) {
-      await tgSendMessage(env, chatId, "Uy, eso esta muy corto. Mande un poquito mas de detalle.", true);
+  if (draft.step === "await_age") {
+    const age = parseAge(text);
+    if (!age) {
+      await tgSendMessage(env, chatId, "Mande un numero valido (18-70) o toque Saltar.", true, {
+        inline_keyboard: [[{ text: "Saltar", callback_data: "rvw:skip" }, { text: "Cancelar", callback_data: "rvw:cancel" }]]
+      });
       return;
     }
-
-    await tgSendMessage(env, chatId, "Deme un toque, la estoy arreglando para que quede bien contada...", true);
-
-    const title = (draft.title ?? "").trim() || `Resena en ${draft.city}`;
-    const story = await improveReviewWithDeepSeek(env, { city: draft.city, title, raw });
-
-    const next: ReviewDraft = { ...draft, title, raw, story, step: "confirm", updatedAt: nowSec() };
+    const next: ReviewDraft = { ...draft, age, updatedAt: nowSec() };
     await putReviewDraft(env, next);
-
-    const preview = [
-      "Asi quedo la resena:",
-      "",
-      `Ciudad: ${next.city}`,
-      `Titulo: ${next.title}`,
-      "",
-      truncate(next.story ?? "", 1400),
-      "",
-      "Si esta bien, toque Publicar. Si no, Editar."
-    ].join("\n");
-
-    await tgSendMessage(env, chatId, preview, true, {
-      inline_keyboard: [[
-        { text: "Publicar", callback_data: "rvw:publish" },
-        { text: "Editar", callback_data: "rvw:edit" },
-        { text: "Cancelar", callback_data: "rvw:cancel" }
-      ]]
-    });
+    await advanceReviewDraft(env, chatId, next);
     return;
   }
 
-  await tgSendMessage(env, chatId, "Toque Publicar / Editar / Cancelar (o /cancel).", true);
+  if (draft.step === "await_height") {
+    const height = parseHeight(text);
+    if (!height) {
+      await tgSendMessage(env, chatId, "Asi: 1.65 o 165 (cm). O toque Saltar.", true, {
+        inline_keyboard: [[{ text: "Saltar", callback_data: "rvw:skip" }, { text: "Cancelar", callback_data: "rvw:cancel" }]]
+      });
+      return;
+    }
+    const next: ReviewDraft = { ...draft, height, updatedAt: nowSec() };
+    await putReviewDraft(env, next);
+    await advanceReviewDraft(env, chatId, next);
+    return;
+  }
+
+  if (draft.step === "await_rate") {
+    const rateCop = parseCop(text);
+    if (!rateCop) {
+      await tgSendMessage(env, chatId, "Mande un numero (COP). Ej: 150000. O toque Saltar.", true, {
+        inline_keyboard: [[{ text: "Saltar", callback_data: "rvw:skip" }, { text: "Cancelar", callback_data: "rvw:cancel" }]]
+      });
+      return;
+    }
+    const next: ReviewDraft = { ...draft, rateCop, updatedAt: nowSec() };
+    await putReviewDraft(env, next);
+    await advanceReviewDraft(env, chatId, next);
+    return;
+  }
+
+  if (draft.step === "await_comment") {
+    const comment = clipText(text, 2000);
+    const next: ReviewDraft = { ...draft, comment, raw: comment, updatedAt: nowSec() };
+    await putReviewDraft(env, next);
+    await advanceReviewDraft(env, chatId, next);
+    return;
+  }
+
+  if (draft.step === "await_phone") {
+    const phone = normalizePhone(text);
+    const digits = phone.replace(/[^0-9]/g, "");
+    if (digits.length > 0 && digits.length < 7) {
+      await tgSendMessage(env, chatId, "Ese numero esta muy corto. Mande el telefono bien o toque Saltar.", true, {
+        inline_keyboard: [[{ text: "Saltar", callback_data: "rvw:skip" }, { text: "Cancelar", callback_data: "rvw:cancel" }]]
+      });
+      return;
+    }
+    const next: ReviewDraft = { ...draft, phone: phone || undefined, updatedAt: nowSec() };
+    await putReviewDraft(env, next);
+    await advanceReviewDraft(env, chatId, next);
+    return;
+  }
+
+  if (draft.step === "await_contact_link") {
+    const link = parseHttpUrl(text);
+    if (!link) {
+      await tgSendMessage(env, chatId, "Mande un link valido (http/https) o toque Saltar.", true, {
+        inline_keyboard: [[{ text: "Saltar", callback_data: "rvw:skip" }, { text: "Cancelar", callback_data: "rvw:cancel" }]]
+      });
+      return;
+    }
+    const next: ReviewDraft = { ...draft, contactLink: link, updatedAt: nowSec() };
+    await putReviewDraft(env, next);
+    await advanceReviewDraft(env, chatId, next);
+    return;
+  }
+
+  await tgSendMessage(env, chatId, "Toque un boton o /cancel.", true, { inline_keyboard: [[{ text: "Cancelar", callback_data: "rvw:cancel" }]] });
 }
 
 function clipText(s: string, max: number): string {
@@ -3086,7 +4395,6 @@ async function notifyUsersAboutReview(env: Env, item: ReviewItem): Promise<void>
   const chatIds = await getUserChatIds(env);
   if (chatIds.length === 0) return;
 
-  const base = publicBaseUrl(env);
   const text = normalize(`${item.city} ${item.title} ${(item.tags ?? []).join(" ")}`);
 
   for (const chatId of chatIds) {
@@ -3110,11 +4418,16 @@ async function notifyUsersAboutReview(env: Env, item: ReviewItem): Promise<void>
       if (!any) continue;
     }
 
-    const row = base
-      ? [{ text: "Abrir", url: `${base}/r/${item.id}` }, { text: "Leer", callback_data: `rvw_read:${item.id}` }]
-      : [{ text: "Leer", callback_data: `rvw_read:${item.id}` }];
-
-    await tgSendMessage(env, u.chatId, `Pilas pues: nueva resena\n[${item.city}] ${item.title}`, true, { inline_keyboard: [row] });
+    const keyboard = buildReviewInlineKeyboard(env, item.id);
+    const votesUp = Number(item.votesUp ?? 0);
+    const votesDown = Number(item.votesDown ?? 0);
+    await tgSendMessage(
+      env,
+      u.chatId,
+      `Pilas pues: nueva resena\n[${item.city}] ${item.title}\nVotos: +${votesUp} / -${votesDown}`,
+      true,
+      keyboard
+    );
   }
 }
 
@@ -3131,8 +4444,23 @@ async function handleReviewPage(request: Request, env: Env): Promise<Response> {
 
   const title = escapeHtml(item.title || "Resena");
   const city = escapeHtml(item.city || "");
-  const story = escapeHtml(item.story || item.raw || "");
+  const votesUp = Math.max(0, Number(item.votesUp ?? 0));
+  const votesDown = Math.max(0, Number(item.votesDown ?? 0));
+  const commentsCount = Math.max(0, Number(item.commentsCount ?? 0));
+  const story = escapeHtml(formatReviewTemplateFromItem(item));
   const created = formatCoDateTimeFromSec(item.createdAt || 0);
+
+  const comments = await listLatestReviewComments(env, item.id, 20);
+  const commentsHtml =
+    comments.length === 0
+      ? `<p class="meta">Todavia no hay opiniones.</p>`
+      : `<div class="comments">${comments
+          .map((c) => {
+            const when = escapeHtml(formatCoDateTimeFromSec(c.createdAt));
+            const body = escapeHtml(c.text || "");
+            return `<div class="c"><div class="cmeta">${when}</div><div class="cbody">${body}</div></div>`;
+          })
+          .join("")}</div>`;
 
   const html = `<!doctype html>
 <html lang="es">
@@ -3145,12 +4473,18 @@ async function handleReviewPage(request: Request, env: Env): Promise<Response> {
       body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 0; background: #0b1220; color: #e8eefc; }
       main { max-width: 860px; margin: 0 auto; padding: 28px 18px 48px; }
       h1 { font-size: 26px; margin: 0 0 8px; }
+      h2 { font-size: 18px; margin: 0 0 10px; }
       .meta { color: #a9b7d6; margin: 0 0 18px; }
       .card { background: #121a2e; border: 1px solid rgba(255,255,255,0.08); border-radius: 14px; padding: 18px; }
       .story { white-space: pre-wrap; line-height: 1.5; }
       a { color: #a6c8ff; }
       .top { display:flex; gap:10px; align-items:center; justify-content:space-between; flex-wrap:wrap; }
       .btn { display:inline-block; background: rgba(37,195,139,0.12); border: 1px solid rgba(37,195,139,0.35); color: #e8eefc; text-decoration:none; padding:10px 12px; border-radius: 12px; font-weight:700; }
+      .split { display:grid; grid-template-columns: 1fr; gap: 12px; margin-top: 12px; }
+      .comments { display:flex; flex-direction:column; gap:10px; }
+      .c { border: 1px solid rgba(255,255,255,0.08); border-radius: 12px; padding: 12px; background: rgba(255,255,255,0.03); }
+      .cmeta { color:#a9b7d6; font-size:12px; margin-bottom:6px; }
+      .cbody { white-space: pre-wrap; line-height: 1.45; }
     </style>
   </head>
   <body>
@@ -3158,12 +4492,18 @@ async function handleReviewPage(request: Request, env: Env): Promise<Response> {
       <div class="top">
         <div>
           <h1>${title}</h1>
-          <p class="meta">Ciudad: ${city} | ${escapeHtml(created)}</p>
+          <p class="meta">Ciudad: ${city} | ${escapeHtml(created)} | Votos: +${votesUp} / -${votesDown} | Opiniones: ${commentsCount}</p>
         </div>
         <a class="btn" href="${escapeHtml(base)}/donar">Apoyar el proyecto</a>
       </div>
-      <div class="card">
-        <div class="story">${story}</div>
+      <div class="split">
+        <div class="card">
+          <div class="story">${story}</div>
+        </div>
+        <div class="card">
+          <h2>Opiniones</h2>
+          ${commentsHtml}
+        </div>
       </div>
     </main>
   </body>
