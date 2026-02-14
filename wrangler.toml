@@ -4,6 +4,18 @@ compatibility_date = "2026-02-01"
 
 [vars]
 SITE_BASE_URL = "https://doncolombia.com"
+# Public URL of this Worker (used for buttons/links inside Telegram).
+# Example: "https://radar-x.<tu_usuario>.workers.dev"
+PUBLIC_BASE_URL = "https://radar-x.artperezjensen.workers.dev"
+
+# Donations (Wompi)
+DONATION_MONTHLY_GOAL_CENTS = "30000000" # 300.000 COP (Wompi uses amount_in_cents = COP * 100)
+DONATION_REFERENCE_PREFIX = "radarx"
+# WOMPI_PUBLIC_KEY = "pub_test_..." # set this in wrangler.toml (not secret)
+
+# Reviews AI (DeepSeek) - optional
+DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+DEEPSEEK_MODEL = "deepseek-chat"
 # Poll interval is controlled by the cron below.
 # If you change the cron, keep it >= 5 minutes to avoid hitting free-tier KV write limits.
 

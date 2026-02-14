@@ -17,6 +17,13 @@ Si el token ya fue compartido en publico, revocalo y genera uno nuevo con BotFat
 - Notificaciones automaticas:
   - Nuevo tema (thread)
   - Nueva respuesta (reply) en foros suscritos (best-effort, basado en timestamps del HTML)
+- Resenas (dentro del bot):
+  - Crear resena por ciudad (wizard)
+  - Ver ultimas resenas filtradas por tus ciudades/temas
+  - Notifica a usuarios con filtros que coincidan
+- Donaciones (Wompi):
+  - Landing `/donar` estilo "vaquita" con meta mensual y botones de $1k/$2k/$5k/$10k
+  - Webhook `/wompi/webhook` para sumar aportes aprobados (APPROVED)
 - Comandos para navegar:
   - `/latest` muestra los ultimos resultados con tus filtros
   - `/leer <url>` devuelve titulo + extracto del contenido (tambien funciona si pegas un link directo)
@@ -34,9 +41,12 @@ Si el token ya fue compartido en publico, revocalo y genera uno nuevo con BotFat
 - `/addprefix <texto>` / `/rmprefix <texto>`
 - `/notify threads on|off`
 - `/notify replies on|off`
+- `/notify reviews on|off`
+- `/notify donations on|off`
 - `/list` (o `/filtros`)
 - `/latest` (o `/ultimos`)
 - `/leer <url>` (o `/read <url>`)
+- `/cancel` (cancelar una resena en curso)
 
 ## Despliegue (Cloudflare Workers + KV + Cron)
 
@@ -71,6 +81,13 @@ npx.cmd wrangler kv namespace create "radar_x_kv_preview" --preview
 ```powershell
 npx.cmd wrangler secret put TELEGRAM_BOT_TOKEN
 npx.cmd wrangler secret put TELEGRAM_WEBHOOK_SECRET_TOKEN
+
+# Wompi (donaciones)
+npx.cmd wrangler secret put WOMPI_INTEGRITY_SECRET
+npx.cmd wrangler secret put WOMPI_EVENTS_SECRET
+
+# DeepSeek (opcional, para mejorar el relato de resenas)
+npx.cmd wrangler secret put DEEPSEEK_API_KEY
 ```
 
 5. Deploy:
@@ -97,3 +114,14 @@ Invoke-RestMethod -Method Post `
 - Si es la primera vez que usas Workers en esa cuenta, registra tu subdominio `workers.dev` en el dashboard de Cloudflare (Workers & Pages) antes del primer deploy.
 - El cron esta configurado en `wrangler.toml` cada 5 minutos (`*/5 * * * *`).
 - La primera ejecucion "primea" estado y no manda spam historico. Para ver contenido inmediato usa `/latest`.
+
+## Config Wompi (resumen)
+
+- Variables en `wrangler.toml`:
+  - `PUBLIC_BASE_URL` (la URL publica del Worker, para links en botones)
+  - `WOMPI_PUBLIC_KEY` (no es secreta)
+  - `DONATION_MONTHLY_GOAL_CENTS` (por defecto 300.000 COP => `30000000`)
+  - `DONATION_REFERENCE_PREFIX` (por defecto `radarx`)
+- Webhook:
+  - En Wompi configura un webhook apuntando a: `https://<TU-WORKER>.workers.dev/wompi/webhook`
+  - El Worker valida el checksum con `WOMPI_EVENTS_SECRET` y solo suma transacciones `APPROVED` cuyo `reference` empiece por `DONATION_REFERENCE_PREFIX`.
